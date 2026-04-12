@@ -1,8 +1,8 @@
-# .github/workflows/update-asn-list.yml
 name: Update ASN list
+
 on:
   schedule:
-    - cron: "0 3 * * *" # каждый день в 3:00 UTC
+    - cron: "0 3 * * *"
   workflow_dispatch:
 
 jobs:
@@ -10,10 +10,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install whois
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y whois
       - name: Generate allowed.lst
         run: |
-          # запуск твоего скрипта генерации
-          bash generate-asn.sh > allowed.lst
+          bash generate-asn.sh --output allowed.lst --logfile update_allowlist.log
       - name: Commit if changed
         run: |
           git config user.email "bot@github.com"
