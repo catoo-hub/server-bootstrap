@@ -59,7 +59,7 @@
 
 ```bash
 # Скачать и запустить интерактивное меню
-curl -O https://github.com/catoo-hub/server-bootstrap/server-bootstrap.sh
+curl -O https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh
 chmod +x server-bootstrap.sh
 sudo bash server-bootstrap.sh
 ```
@@ -73,13 +73,13 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 > 💡 **Про запуск через curl:**
 > ```bash
 > # ✅ Правильно — process substitution, stdin остаётся терминалом
-> bash <(curl -Ls https://github.com/catoo-hub/server-bootstrap/server-bootstrap.sh)
+> bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh)
 >
 > # ✅ Правильно — неинтерактивный (работает и через пайп)
-> bash <(curl -Ls https://github.com/catoo-hub/server-bootstrap/server-bootstrap.sh) --mode node --non-interactive
+> bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh) --mode node --non-interactive
 >
 > # ❌ Неправильно — curl занимает stdin, интерактивные read сломаются
-> curl -Ls https://github.com/catoo-hub/server-bootstrap/server-bootstrap.sh | bash
+> curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh | bash
 > ```
 > Скрипт автоматически определяет pipe-режим (`[[ ! -t 0 ]]`) и форсирует `--non-interactive`.
 > Если при этом не указан `--mode` — скрипт завершится с ошибкой и подскажет правильную команду.
@@ -623,7 +623,7 @@ sudo bash server-bootstrap.sh --mode base --skip-update --non-interactive
 
 ```bash
 # Download and launch the interactive menu
-curl -O https://github.com/catoo-hub/server-bootstrap/server-bootstrap.sh
+curl -O https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh
 chmod +x server-bootstrap.sh
 sudo bash server-bootstrap.sh
 ```
@@ -637,13 +637,13 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 > 💡 **About running via curl:**
 > ```bash
 > # ✅ Correct — process substitution keeps stdin as the terminal
-> bash <(curl -Ls https://github.com/catoo-hub/server-bootstrap/server-bootstrap.sh)
+> bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh)
 >
 > # ✅ Correct — non-interactive works with both pipe and process substitution
-> bash <(curl -Ls https://github.com/catoo-hub/server-bootstrap/server-bootstrap.sh) --mode node --non-interactive
+> bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh) --mode node --non-interactive
 >
 > # ❌ Wrong — curl consumes stdin, all interactive `read` calls break
-> curl -Ls https://github.com/catoo-hub/server-bootstrap/server-bootstrap.sh | bash
+> curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh | bash
 > ```
 > The script auto-detects pipe mode (`[[ ! -t 0 ]]`) and forces `--non-interactive`.
 > If `--mode` is not provided in this case, the script exits with a clear error message.
