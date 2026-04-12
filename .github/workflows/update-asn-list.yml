@@ -5,6 +5,9 @@ on:
     - cron: "0 3 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -21,4 +24,8 @@ jobs:
         run: |
           git config user.email "bot@github.com"
           git config user.name "ASN Bot"
-          git diff --quiet allowed.lst || (git add allowed.lst && git commit -m "Update ASN list" && git push)
+          if [[ -n "$(git status --porcelain -- allowed.lst)" ]]; then
+            git add allowed.lst
+            git commit -m "Update ASN list"
+            git push
+          fi
