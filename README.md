@@ -75,6 +75,9 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 > # ✅ Правильно — process substitution, stdin остаётся терминалом
 > bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh)
 >
+> # ⚠️ Тестовый режим нового роутера
+> bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap-v-1-0-1.sh)
+>
 > # ✅ Правильно — неинтерактивный (работает и через пайп)
 > bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh) --mode node --non-interactive
 >
@@ -638,6 +641,9 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 > ```bash
 > # ✅ Correct — process substitution keeps stdin as the terminal
 > bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh)
+>
+> # ⚠️ Test version of new Router mode (WL)
+> bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap-v-1-0-1.sh)
 >
 > # ✅ Correct — non-interactive works with both pipe and process substitution
 > bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh) --mode node --non-interactive
