@@ -2,7 +2,7 @@
 # ==============================================================================
 #  server-bootstrap.sh — Production-ready server/node setup script
 #  Supports: Debian 12+ / Ubuntu 22.04+  |  Requires: root
-#  Modes: base | node | gate | bs | custom
+#  Modes: base | node | gate | relay | custom
 #
 #  Usage (interactive):   bash server-bootstrap.sh
 #  Usage (non-interactive): bash server-bootstrap.sh --mode node [--options]
@@ -32,8 +32,8 @@ VERBOSE=false
 NON_INTERACTIVE=false
 SKIP_SELFSTEAL=false
 SKIP_UPDATE=false
-MODE=""         # base | node | gate | bs | custom
-GATE_ADDRESS="" # used in bs mode
+MODE=""         # base | node | gate | relay | custom
+GATE_ADDRESS="" # used in relay mode
 
 # ── Auto-detect pipe mode (curl URL | bash kills stdin) ───────────────────────
 # If stdin is NOT a terminal, force non-interactive to protect all `read` calls.
@@ -518,7 +518,7 @@ EOF
 }
 
 apply_sysctl_router() {
-    log_step "Applying router/BS sysctl settings"
+    log_step "Applying router/Relay sysctl settings"
 
     local router_file="/etc/sysctl.d/99-router.conf"
     backup_file "$router_file"
@@ -564,7 +564,7 @@ _get_ssh_port() {
 }
 
 setup_ufw() {
-    local mode="${1:-base}" # base | node | gate | bs
+    local mode="${1:-base}" # base | node | gate | relay
     log_step "Configuring UFW (mode: ${mode})"
 
     install_packages ufw
@@ -595,7 +595,7 @@ setup_ufw() {
             ufw allow 80/tcp   comment 'HTTP'         &>/dev/null
             ufw allow 8443/tcp comment 'Alt-HTTPS'    &>/dev/null
             ;;
-        bs)
+        relay)
             ufw allow 443/tcp  comment 'HAProxy TCP proxy' &>/dev/null
             ;;
         base|*)
@@ -658,7 +658,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 11 · HAPROXY (BS/router mode)
+# SECTION 11 · HAPROXY (Relay/router mode)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Validate IPv4 address
@@ -674,13 +674,13 @@ _validate_ip() {
 }
 
 setup_haproxy() {
-    log_step "Configuring HAProxy (BS/router mode)"
+    log_step "Configuring HAProxy (Relay/router mode)"
     install_packages haproxy
 
     # Get gate address
     if [[ -z "$GATE_ADDRESS" ]]; then
         if [[ "$NON_INTERACTIVE" == true ]]; then
-            log_error "--gate-address is required in non-interactive BS mode"
+            log_error "--gate-address is required in non-interactive Relay mode"
             exit 1
         fi
         while true; do
@@ -753,7 +753,7 @@ EOF
 
 MOBILE443_BASE_URL="https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main"
 
-# mode: node | gate | bs
+# mode: node | gate | relay
 install_mobile443_filter() {
     local mode="${1:-node}"
     log_step "Installing mobile443-filter (mode: ${mode})"
@@ -761,7 +761,7 @@ install_mobile443_filter() {
     local script_url
     case "$mode" in
         gate) script_url="${MOBILE443_BASE_URL}/install_block_only.sh" ;;
-        node|bs|*) script_url="${MOBILE443_BASE_URL}/install.sh" ;;
+        node|relay|*) script_url="${MOBILE443_BASE_URL}/install.sh" ;;
     esac
 
     log_info "Script URL: ${script_url}"
@@ -1073,8 +1073,8 @@ run_gate() {
     STEP_STATUS["mode"]="gate/OK"
 }
 
-run_bs() {
-    log_step "MODE: BS (ROUTER)"
+run_relay() {
+    log_step "MODE: Relay (NODE RELAY)"
     apt_update
     setup_base_packages
     setup_timezone
@@ -1082,12 +1082,12 @@ run_bs() {
     apply_sysctl_network
     apply_sysctl_router
     setup_swap
-    setup_ufw "bs"
+    setup_ufw "relay"
     setup_fail2ban
     setup_haproxy
-    install_mobile443_filter "bs"
+    install_mobile443_filter "relay"
     # No remnanode, no selfsteal by default
-    STEP_STATUS["mode"]="bs/OK"
+    STEP_STATUS["mode"]="relay/OK"
 }
 
 run_custom() {
@@ -1104,10 +1104,10 @@ run_custom() {
     _ask "Apply router sysctl (block ICMP, disable IPv6)?" && apply_sysctl_router
     _ask "Configure UFW?"         && setup_ufw "node"
     _ask "Configure Fail2Ban?"    && setup_fail2ban
-    _ask "Install HAProxy (BS mode)?" && setup_haproxy
+    _ask "Install HAProxy (Relay mode)?" && setup_haproxy
     _ask "Install mobile443-filter?" && {
         local m
-        read -rp "  Mode for mobile443-filter [node/gate/bs]: " m
+        read -rp "  Mode for mobile443-filter [node/gate/relay]: " m
         install_mobile443_filter "${m:-node}"
     }
     _ask "Install remnanode?"     && install_remnanode
@@ -1131,7 +1131,7 @@ show_menu() {
         echo -e "  ${CYAN}1)${RESET} base    — Base server preparation only"
         echo -e "  ${CYAN}2)${RESET} node    — Regular node (base + remnanode + selfsteal)"
         echo -e "  ${CYAN}3)${RESET} gate    — Gate node (base + remnanode + selfsteal + block-only filter)"
-        echo -e "  ${CYAN}4)${RESET} bs      — BS/Router mode (base + haproxy + mobile443 filter)"
+        echo -e "  ${CYAN}4)${RESET} relay   — Relay/Node Relay mode (base + haproxy + mobile443 filter)"
         echo -e "  ${CYAN}5)${RESET} custom  — Step-by-step component selection"
         echo ""
         echo -e "  ${YELLOW}s)${RESET} Status  — Show current system status"
@@ -1146,7 +1146,7 @@ show_menu() {
             1) MODE="base";   show_summary_confirm && run_base   ;;
             2) MODE="node";   show_summary_confirm && run_node   ;;
             3) MODE="gate";   show_summary_confirm && run_gate   ;;
-            4) MODE="bs";     show_summary_confirm && run_bs     ;;
+            4) MODE="relay";  show_summary_confirm && run_relay  ;;
             5) MODE="custom"; run_custom ;;
             s|S) check_status_all; read -rp "  Press Enter to continue..." _ ;;
             d|D) DRY_RUN=$([ "$DRY_RUN" == true ] && echo false || echo true); log_info "Dry-run: ${DRY_RUN}" ;;
@@ -1188,8 +1188,8 @@ ${BOLD}Usage:${RESET}
   ${SCRIPT_NAME} [OPTIONS]
 
 ${BOLD}Options:${RESET}
-  --mode <mode>          Run mode: base | node | gate | bs | custom
-  --gate-address <ip>    Gate IP address (required for bs mode)
+  --mode <mode>          Run mode: base | node | gate | relay | custom
+  --gate-address <ip>    Gate IP address (required for relay mode)
   --dry-run              Simulate — no changes applied
   --verbose, -v          Enable verbose/debug output
   --skip-selfsteal       Skip selfsteal installation
@@ -1206,8 +1206,8 @@ ${BOLD}Examples:${RESET}
   # Non-interactive node setup
   bash ${SCRIPT_NAME} --mode node --non-interactive
 
-  # BS/Router mode with gate address
-  bash ${SCRIPT_NAME} --mode bs --gate-address 1.2.3.4 --non-interactive
+  # Relay/Node Relay mode with gate address
+  bash ${SCRIPT_NAME} --mode relay --gate-address 1.2.3.4 --non-interactive
 
   # Dry run (preview only)
   bash ${SCRIPT_NAME} --mode node --dry-run --verbose
@@ -1272,10 +1272,10 @@ main() {
             base)   run_base   ;;
             node)   run_node   ;;
             gate)   run_gate   ;;
-            bs)     run_bs     ;;
+            relay)  run_relay  ;;
             custom) run_custom ;;
             *)
-                log_error "Unknown mode: '${MODE}'. Valid: base | node | gate | bs | custom"
+                log_error "Unknown mode: '${MODE}'. Valid: base | node | gate | relay | custom"
                 exit 1
                 ;;
         esac
@@ -1291,7 +1291,7 @@ main() {
             base)   show_summary_confirm && run_base   ;;
             node)   show_summary_confirm && run_node   ;;
             gate)   show_summary_confirm && run_gate   ;;
-            bs)     show_summary_confirm && run_bs     ;;
+            relay)  show_summary_confirm && run_relay  ;;
             custom) run_custom ;;
             *)
                 log_error "Unknown mode: '${MODE}'"
@@ -1325,7 +1325,7 @@ main "$@"
 #   sudo bash server-bootstrap.sh --mode base --non-interactive
 #   sudo bash server-bootstrap.sh --mode node --non-interactive
 #   sudo bash server-bootstrap.sh --mode gate --non-interactive --skip-selfsteal
-#   sudo bash server-bootstrap.sh --mode bs   --gate-address 1.2.3.4 --non-interactive
+#   sudo bash server-bootstrap.sh --mode relay --gate-address 1.2.3.4 --non-interactive
 #
 # ── Dev/testing ───────────────────────────────────────────────────────────────
 #   sudo bash server-bootstrap.sh --mode node --dry-run --verbose

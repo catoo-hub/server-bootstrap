@@ -2,7 +2,7 @@
 # ==============================================================================
 #  server-bootstrap.sh — Production-ready server/node setup script
 #  Supports: Debian 12+ / Ubuntu 22.04+  |  Requires: root
-#  Modes: base | node | gate | bs | custom
+#  Modes: base | node | gate | relay | custom
 #
 #  Usage (interactive):   bash server-bootstrap.sh
 #  Usage (non-interactive): bash server-bootstrap.sh --mode node [--options]
@@ -32,11 +32,11 @@ VERBOSE=false
 NON_INTERACTIVE=false
 SKIP_SELFSTEAL=false
 SKIP_UPDATE=false
-MODE=""         # base | node | gate | bs | custom
-GATE_ADDRESS="" # used in bs mode
-RELAY_ADDRESS=""  # BS: this server's IP (auto-detected if empty)
-RELAY_PORT="443"  # BS: port haproxy binds on
-GATE_PORT="9443"  # BS: port on gate (recommended: NOT 443)
+MODE=""         # base | node | gate | relay | custom
+GATE_ADDRESS="" # used in relay mode
+RELAY_ADDRESS=""  # Relay: this server's IP (auto-detected if empty)
+RELAY_PORT="443"  # Relay: port haproxy binds on
+GATE_PORT="9443"  # Relay: port on gate (recommended: NOT 443)
 
 # ── Auto-detect pipe mode (curl URL | bash kills stdin) ───────────────────────
 # If stdin is NOT a terminal, force non-interactive to protect all `read` calls.
@@ -521,7 +521,7 @@ EOF
 }
 
 apply_sysctl_router() {
-    log_step "Applying router/BS sysctl settings"
+    log_step "Applying router/Relay sysctl settings"
 
     local router_file="/etc/sysctl.d/99-router.conf"
     backup_file "$router_file"
@@ -567,7 +567,7 @@ _get_ssh_port() {
 }
 
 setup_ufw() {
-    local mode="${1:-base}" # base | node | gate | bs
+    local mode="${1:-base}" # base | node | gate | relay
     log_step "Configuring UFW (mode: ${mode})"
 
     install_packages ufw
@@ -598,7 +598,7 @@ setup_ufw() {
             ufw allow 80/tcp   comment 'HTTP'         &>/dev/null
             ufw allow 8443/tcp comment 'Alt-HTTPS'    &>/dev/null
             ;;
-        bs)
+        relay)
             ufw allow 443/tcp  comment 'HAProxy TCP proxy' &>/dev/null
             ;;
         base|*)
@@ -661,7 +661,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 11 · HAPROXY (BS/router mode)
+# SECTION 11 · HAPROXY (Relay/router mode)
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # Architecture:
@@ -694,9 +694,9 @@ _validate_port() {
     [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
 }
 
-# ── Install HAProxy 2.8 via official PPA ─────────────────────────────────────
+# ── Install HAProxy 2.8 with robust fallback (no hard PPA dependency) ────────
 _install_haproxy_28() {
-    log_info "Installing HAProxy 2.8.* via PPA..."
+    log_info "Installing HAProxy 2.8.*"
 
     # Check if already correct version
     if command -v haproxy &>/dev/null; then
@@ -711,15 +711,76 @@ _install_haproxy_28() {
 
     install_packages software-properties-common apt-transport-https
 
-    # Add PPA (Debian uses different approach than Ubuntu)
-    if [[ "$OS_ID" == "ubuntu" ]]; then
-        add-apt-repository ppa:vbernat/haproxy-2.8 -y &>/dev/null
-        DEBIAN_FRONTEND=noninteractive $PKG_MGR update -qq
+    # 1) Try distro repositories first (works on Ubuntu noble-updates)
+    if apt-cache madison haproxy 2>/dev/null | grep -qE '2\.8\.'; then
+        log_info "HAProxy 2.8 found in distro repository, installing without external PPA"
         DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy=2.8.\* \
             -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" && {
+            log_ok "HAProxy installed from distro repo: $(haproxy -v 2>/dev/null | head -1)"
+            return 0
+        }
+        log_warn "Version-pinned install failed from distro repo, trying generic haproxy package"
+        DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" && {
+            local ver2
+            ver2="$(haproxy -v 2>/dev/null | head -1 | grep -oP '(?<=version )\d+\.\d+' || true)"
+            if [[ "$ver2" == "2.8" ]]; then
+                log_ok "HAProxy installed from distro repo: $(haproxy -v 2>/dev/null | head -1)"
+                return 0
+            fi
+        }
+        log_warn "Distro install did not provide HAProxy 2.8, trying external repository fallback"
+    fi
+
+    # 2) Fallback path for systems where 2.8 is absent in distro repos
+    if [[ "$OS_ID" == "ubuntu" ]]; then
+        log_info "Trying Ubuntu PPA fallback: ppa:vbernat/haproxy-2.8"
+        add-apt-repository ppa:vbernat/haproxy-2.8 -y &>/dev/null || {
+            log_warn "Could not add PPA. Will fallback to generic distro haproxy package."
+            DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy \
+                -o Dpkg::Options::="--force-confdef" \
+                -o Dpkg::Options::="--force-confold"
+            log_ok "HAProxy installed (fallback): $(haproxy -v 2>/dev/null | head -1)"
+            return 0
+        }
+
+        if ! DEBIAN_FRONTEND=noninteractive $PKG_MGR update -qq; then
+            log_warn "PPA update failed (possibly unsupported distro codename). Removing PPA and falling back."
+            rm -f /etc/apt/sources.list.d/vbernat-ubuntu-haproxy-2_8-*.sources \
+                  /etc/apt/sources.list.d/vbernat-ubuntu-haproxy-2_8-*.list 2>/dev/null || true
+            DEBIAN_FRONTEND=noninteractive $PKG_MGR update -qq || true
+            DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy \
+                -o Dpkg::Options::="--force-confdef" \
+                -o Dpkg::Options::="--force-confold"
+            log_ok "HAProxy installed (fallback): $(haproxy -v 2>/dev/null | head -1)"
+            return 0
+        fi
+
+        if DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy=2.8.\* \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold"; then
+            log_ok "HAProxy installed from PPA: $(haproxy -v 2>/dev/null | head -1)"
+            return 0
+        fi
+
+        log_warn "PPA install failed, trying generic distro haproxy package"
+        DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy \
+            -o Dpkg::Options::="--force-confdef" \
             -o Dpkg::Options::="--force-confold"
+        log_ok "HAProxy installed (fallback): $(haproxy -v 2>/dev/null | head -1)"
     else
-        # Debian: use haproxy.debian.net repo
+        # Debian fallback chain: distro repo first, then haproxy.debian.net
+        log_info "Trying Debian distro repository first"
+        if DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy=2.8.\* \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold"; then
+            log_ok "HAProxy installed from distro repo: $(haproxy -v 2>/dev/null | head -1)"
+            return 0
+        fi
+
+        log_warn "Debian distro repo does not provide HAProxy 2.8, using haproxy.debian.net"
         curl -fsSL https://haproxy.debian.net/bernat.debian.net.gpg \
             | gpg --dearmor -o /usr/share/keyrings/haproxy.debian.net.gpg
 
@@ -731,13 +792,13 @@ https://haproxy.debian.net bookworm-backports-2.8 main" \
         DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy=2.8.\* \
             -o Dpkg::Options::="--force-confdef" \
             -o Dpkg::Options::="--force-confold"
-    fi
 
-    log_ok "HAProxy installed: $(haproxy -v 2>/dev/null | head -1)"
+        log_ok "HAProxy installed from haproxy.debian.net: $(haproxy -v 2>/dev/null | head -1)"
+    fi
 }
 
-# ── Ask / validate BS parameters ─────────────────────────────────────────────
-_ask_bs_params() {
+# ── Ask / validate Relay parameters ──────────────────────────────────────────
+_ask_relay_params() {
     # RELAY_ADDRESS
     if [[ -z "${RELAY_ADDRESS:-}" ]]; then
         if [[ "$NON_INTERACTIVE" == true ]]; then
@@ -768,7 +829,7 @@ _ask_bs_params() {
     # GATE_ADDRESS
     if [[ -z "${GATE_ADDRESS:-}" ]]; then
         if [[ "$NON_INTERACTIVE" == true ]]; then
-            log_error "--gate-address is required in non-interactive BS mode"
+            log_error "--gate-address is required in non-interactive Relay mode"
             exit 1
         fi
         while true; do
@@ -985,10 +1046,10 @@ EOF
 
 # ── Main HAProxy setup entry point ────────────────────────────────────────────
 setup_haproxy() {
-    log_step "Configuring HAProxy 2.8 (BS/router mode)"
+    log_step "Configuring HAProxy 2.8 (Relay/router mode)"
 
     if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would install HAProxy 2.8 via PPA"
+        log_dry "Would install HAProxy 2.8 (distro-first, PPA fallback)"
         log_dry "Would configure: RELAY:${RELAY_ADDRESS:-?}:${RELAY_PORT:-443} → GATE:${GATE_ADDRESS:-?}:${GATE_PORT:-9443}"
         log_dry "Would create: update_blocklist.sh, update_allowlist.sh, analyze_logs.sh"
         log_dry "Would configure: rsyslog split logs, logrotate (hourly/24h), cron (04:20)"
@@ -997,7 +1058,7 @@ setup_haproxy() {
     fi
 
     # 1. Collect parameters
-    _ask_bs_params
+    _ask_relay_params
 
     # 2. Install HAProxy 2.8
     _install_haproxy_28
@@ -1059,7 +1120,7 @@ setup_haproxy() {
 
 MOBILE443_BASE_URL="https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main"
 
-# mode: node | gate | bs
+# mode: node | gate | relay
 install_mobile443_filter() {
     local mode="${1:-node}"
     log_step "Installing mobile443-filter (mode: ${mode})"
@@ -1067,7 +1128,7 @@ install_mobile443_filter() {
     local script_url
     case "$mode" in
         gate) script_url="${MOBILE443_BASE_URL}/install_block_only.sh" ;;
-        node|bs|*) script_url="${MOBILE443_BASE_URL}/install.sh" ;;
+        node|relay|*) script_url="${MOBILE443_BASE_URL}/install.sh" ;;
     esac
 
     log_info "Script URL: ${script_url}"
@@ -1379,9 +1440,9 @@ run_gate() {
     STEP_STATUS["mode"]="gate/OK"
 }
 
-run_bs() {
-    log_step "MODE: BS (ROUTER)"
-    # BS mode: HAProxy handles traffic filtering via blocked.lst + allowed.lst.
+run_relay() {
+    log_step "MODE: Relay (NODE RELAY)"
+    # Relay mode: HAProxy handles traffic filtering via blocked.lst + allowed.lst.
     # mobile443-filter is NOT used here — allowlist logic replaces it.
     # remnanode and selfsteal are NOT installed on a relay/router node.
     apt_update
@@ -1389,12 +1450,12 @@ run_bs() {
     setup_timezone
     setup_ssh
     apply_sysctl_network
-    apply_sysctl_router   # disable IPv6, block ICMP, enable ip_forward
+    apply_sysctl_router      # disable IPv6, block ICMP, enable ip_forward
     setup_swap
-    setup_ufw "bs"        # opens SSH + 443/tcp only
+    setup_ufw "relay"        # opens SSH + 443/tcp only
     setup_fail2ban
-    setup_haproxy         # HAProxy 2.8 + blocklist + allowlist + rsyslog + cron
-    STEP_STATUS["mode"]="bs/OK"
+    setup_haproxy            # HAProxy 2.8 + blocklist + allowlist + rsyslog + cron
+    STEP_STATUS["mode"]="relay/OK"
 }
 
 run_custom() {
@@ -1411,10 +1472,10 @@ run_custom() {
     _ask "Apply router sysctl (block ICMP, disable IPv6)?" && apply_sysctl_router
     _ask "Configure UFW?"         && setup_ufw "node"
     _ask "Configure Fail2Ban?"    && setup_fail2ban
-    _ask "Install HAProxy (BS mode)?" && setup_haproxy
+    _ask "Install HAProxy (Relay mode)?" && setup_haproxy
     _ask "Install mobile443-filter?" && {
         local m
-        read -rp "  Mode for mobile443-filter [node/gate/bs]: " m
+        read -rp "  Mode for mobile443-filter [node/gate/relay]: " m
         install_mobile443_filter "${m:-node}"
     }
     _ask "Install remnanode?"     && install_remnanode
@@ -1438,7 +1499,7 @@ show_menu() {
         echo -e "  ${CYAN}1)${RESET} base    — Base server preparation only"
         echo -e "  ${CYAN}2)${RESET} node    — Regular node (base + remnanode + selfsteal)"
         echo -e "  ${CYAN}3)${RESET} gate    — Gate node (base + remnanode + selfsteal + block-only filter)"
-        echo -e "  ${CYAN}4)${RESET} bs      — BS/Router mode (base + haproxy + mobile443 filter)"
+        echo -e "  ${CYAN}4)${RESET} relay   — Relay/Node Relay mode (base + haproxy + mobile443 filter)"
         echo -e "  ${CYAN}5)${RESET} custom  — Step-by-step component selection"
         echo ""
         echo -e "  ${YELLOW}s)${RESET} Status  — Show current system status"
@@ -1453,7 +1514,7 @@ show_menu() {
             1) MODE="base";   show_summary_confirm && run_base   ;;
             2) MODE="node";   show_summary_confirm && run_node   ;;
             3) MODE="gate";   show_summary_confirm && run_gate   ;;
-            4) MODE="bs";     show_summary_confirm && run_bs     ;;
+            4) MODE="relay";  show_summary_confirm && run_relay  ;;
             5) MODE="custom"; run_custom ;;
             s|S) check_status_all; read -rp "  Press Enter to continue..." _ ;;
             d|D) DRY_RUN=$([ "$DRY_RUN" == true ] && echo false || echo true); log_info "Dry-run: ${DRY_RUN}" ;;
@@ -1495,8 +1556,8 @@ ${BOLD}Usage:${RESET}
   ${SCRIPT_NAME} [OPTIONS]
 
 ${BOLD}Options:${RESET}
-  --mode <mode>          Run mode: base | node | gate | bs | custom
-  --gate-address <ip>    Gate IP address (required for bs mode)
+  --mode <mode>          Run mode: base | node | gate | relay | custom
+  --gate-address <ip>    Gate IP address (required for relay mode)
   --dry-run              Simulate — no changes applied
   --verbose, -v          Enable verbose/debug output
   --skip-selfsteal       Skip selfsteal installation
@@ -1513,8 +1574,8 @@ ${BOLD}Examples:${RESET}
   # Non-interactive node setup
   bash ${SCRIPT_NAME} --mode node --non-interactive
 
-  # BS/Router mode with gate address
-  bash ${SCRIPT_NAME} --mode bs --gate-address 1.2.3.4 --non-interactive
+  # Relay/Node Relay mode with gate address
+  bash ${SCRIPT_NAME} --mode relay --gate-address 1.2.3.4 --non-interactive
 
   # Dry run (preview only)
   bash ${SCRIPT_NAME} --mode node --dry-run --verbose
@@ -1579,13 +1640,13 @@ main() {
     # Non-interactive with --mode
     if [[ "$NON_INTERACTIVE" == true && -n "$MODE" ]]; then
         case "$MODE" in
-            base)   run_base   ;;
-            node)   run_node   ;;
-            gate)   run_gate   ;;
-            bs)     run_bs     ;;
-            custom) run_custom ;;
+            base)   run_base    ;;
+            node)   run_node    ;;
+            gate)   run_gate    ;;
+            relay)  run_relay   ;;
+            custom) run_custom  ;;
             *)
-                log_error "Unknown mode: '${MODE}'. Valid: base | node | gate | bs | custom"
+                log_error "Unknown mode: '${MODE}'. Valid: base | node | gate | relay | custom"
                 exit 1
                 ;;
         esac
@@ -1598,10 +1659,10 @@ main() {
     # Interactive with --mode (ask for confirm)
     if [[ -n "$MODE" ]]; then
         case "$MODE" in
-            base)   show_summary_confirm && run_base   ;;
-            node)   show_summary_confirm && run_node   ;;
-            gate)   show_summary_confirm && run_gate   ;;
-            bs)     show_summary_confirm && run_bs     ;;
+            base)   show_summary_confirm && run_base    ;;
+            node)   show_summary_confirm && run_node    ;;
+            gate)   show_summary_confirm && run_gate    ;;
+            relay)  show_summary_confirm && run_relay   ;;
             custom) run_custom ;;
             *)
                 log_error "Unknown mode: '${MODE}'"
