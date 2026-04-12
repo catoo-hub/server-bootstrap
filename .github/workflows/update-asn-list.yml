@@ -1,0 +1,21 @@
+# .github/workflows/update-asn-list.yml
+name: Update ASN list
+on:
+  schedule:
+    - cron: "0 3 * * *" # каждый день в 3:00 UTC
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate allowed.lst
+        run: |
+          # запуск твоего скрипта генерации
+          bash generate-asn.sh > allowed.lst
+      - name: Commit if changed
+        run: |
+          git config user.email "bot@github.com"
+          git config user.name "ASN Bot"
+          git diff --quiet allowed.lst || (git add allowed.lst && git commit -m "Update ASN list" && git push)

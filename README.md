@@ -29,7 +29,7 @@
 
 ## Описание
 
-`server-bootstrap.sh` — production-ready bash-скрипт для первичной настройки серверов и нод на **Debian 12+** и **Ubuntu 22.04+**. Разработан для автоматизации развёртывания инфраструктуры с несколькими предустановленными режимами: обычная нода, gate-нода, BS/роутер, базовая подготовка сервера и пошаговый кастомный режим.
+`server-bootstrap.sh` — production-ready bash-скрипт для первичной настройки серверов и нод на **Debian 12+** и **Ubuntu 22.04+**. Разработан для автоматизации развёртывания инфраструктуры с несколькими предустановленными режимами: обычная нода, gate-нода, Relay/Node Relay, базовая подготовка сервера и пошаговый кастомный режим.
 
 **Ключевые принципы:**
 
@@ -98,7 +98,7 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 | `base` | Базовая подготовка сервера | `--mode base` |
 | `node` | Обычная нода | `--mode node` |
 | `gate` | Gate-нода | `--mode gate` |
-| `bs` | BS/Роутер режим | `--mode bs` |
+| `relay` | Relay/Node Relay режим | `--mode relay` |
 | `custom` | Пошаговый выбор компонентов | `--mode custom` |
 
 ---
@@ -108,8 +108,8 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 ```
 Флаг                        Описание
 ────────────────────────────────────────────────────────────
---mode <mode>               Режим: base | node | gate | bs | custom
---gate-address <ip>         IP-адрес gate-ноды (обязателен для режима bs)
+--mode <mode>               Режим: base | node | gate | relay | custom
+--gate-address <ip>         IP-адрес gate-ноды (обязателен для режима relay)
 --dry-run                   Режим симуляции — изменения не применяются
 --verbose, -v               Подробный вывод (debug-уровень)
 --skip-selfsteal            Пропустить установку selfsteal
@@ -150,10 +150,10 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 sudo bash server-bootstrap.sh --mode gate --skip-selfsteal --non-interactive
 ```
 
-### BS/Роутер с указанием gate
+### Relay/Node Relay с указанием gate
 
 ```bash
-sudo bash server-bootstrap.sh --mode bs --gate-address 185.100.200.5 --non-interactive
+sudo bash server-bootstrap.sh --mode relay --gate-address 185.100.200.5 --non-interactive
 ```
 
 ### Пошаговый выбор компонентов
@@ -221,7 +221,7 @@ sudo bash server-bootstrap.sh --mode base --skip-update --non-interactive
 
 **Отличие от `node`**: используется `block-only` режим mobile443-filter — трафик с мобильных операторов блокируется, а не перенаправляется.
 
-### `bs` — BS/Роутер режим
+### `relay` — Relay/Node Relay режим
 
 Всё из `base`, плюс:
 
@@ -263,9 +263,9 @@ sudo bash server-bootstrap.sh --mode base --skip-update --non-interactive
 | Файл | Назначение |
 |------|-----------|
 | `/etc/sysctl.d/99-custom-network.conf` | Сетевые настройки (все режимы) |
-| `/etc/sysctl.d/99-router.conf` | Роутер-специфичные настройки (только BS) |
+| `/etc/sysctl.d/99-router.conf` | Роутер-специфичные настройки (только Relay) |
 
-### Применяемые параметры (все режимы node/gate/bs)
+### Применяемые параметры (все режимы node/gate/relay)
 
 ```ini
 # TCP буферы приёма: min / default / max
@@ -293,7 +293,7 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 ```
 
-### Дополнительные параметры для BS/роутера
+### Дополнительные параметры для Relay/Node Relay
 
 ```ini
 # Блокировка ICMP ping
@@ -326,11 +326,11 @@ net.ipv4.ip_forward = 1
 │   ├── server-bootstrap.conf             ← Конфиг с параметрами последнего запуска
 │   ├── sysctl.d/
 │   │   ├── 99-custom-network.conf        ← Сетевые sysctl
-│   │   └── 99-router.conf               ← Router sysctl (только BS)
+│   │   └── 99-router.conf               ← Router sysctl (только Relay)
 │   ├── fail2ban/
 │   │   └── jail.local                   ← Fail2Ban конфиг
 │   └── haproxy/
-│       └── haproxy.cfg                  ← HAProxy конфиг (только BS)
+│       └── haproxy.cfg                  ← HAProxy конфиг (только Relay)
 ```
 
 ---
@@ -389,7 +389,7 @@ systemctl restart haproxy                  # только если OK
 
 | Режим | Скрипт |
 |-------|--------|
-| `node` / `bs` | `install.sh` |
+| `node` / `relay` | `install.sh` |
 | `gate` | `install_block_only.sh` |
 
 Источник: `https://github.com/wh3r3ar3you/mobile443-filter`
@@ -401,7 +401,7 @@ systemctl restart haproxy                  # только если OK
 bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh) @ install
 ```
 
-Используется в режимах: `node`, `gate`. **Не устанавливается** в режиме `bs`.
+Используется в режимах: `node`, `gate`. **Не устанавливается** в режиме `relay`.
 
 ### selfsteal
 
@@ -412,7 +412,7 @@ bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal
 
 Используется в режимах: `node`, `gate`. Можно пропустить через `--skip-selfsteal`.
 
-### HAProxy (только BS)
+### HAProxy (только Relay)
 
 TCP-прокси с `send-proxy-v2`. Конфигурация:
 
@@ -596,7 +596,7 @@ sudo bash server-bootstrap.sh --mode base --skip-update --non-interactive
 
 ## Description
 
-`server-bootstrap.sh` is a production-ready Bash script for initial setup of servers and nodes running **Debian 12+** or **Ubuntu 22.04+**. It automates infrastructure deployment with several preset modes: regular node, gate node, BS/router, base server preparation, and a step-by-step custom mode.
+`server-bootstrap.sh` is a production-ready Bash script for initial setup of servers and nodes running **Debian 12+** or **Ubuntu 22.04+**. It automates infrastructure deployment with several preset modes: regular node, gate node, Relay/Node Relay, base server preparation, and a step-by-step custom mode.
 
 **Core principles:**
 
@@ -665,7 +665,7 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 | `base` | Base server preparation | `--mode base` |
 | `node` | Regular node | `--mode node` |
 | `gate` | Gate node | `--mode gate` |
-| `bs` | BS / Router mode | `--mode bs` |
+| `relay` | Relay / Node Relay mode | `--mode relay` |
 | `custom` | Step-by-step component selection | `--mode custom` |
 
 ---
@@ -675,8 +675,8 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 ```
 Flag                          Description
 ────────────────────────────────────────────────────────────────
---mode <mode>                 Mode: base | node | gate | bs | custom
---gate-address <ip>           Gate node IP address (required for bs mode)
+--mode <mode>                 Mode: base | node | gate | relay | custom
+--gate-address <ip>           Gate node IP address (required for relay mode)
 --dry-run                     Simulation mode — no changes applied
 --verbose, -v                 Verbose/debug output
 --skip-selfsteal              Skip selfsteal installation
@@ -717,10 +717,10 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 sudo bash server-bootstrap.sh --mode gate --skip-selfsteal --non-interactive
 ```
 
-### BS/Router with a specific gate address
+### Relay/Node Relay with a specific gate address
 
 ```bash
-sudo bash server-bootstrap.sh --mode bs --gate-address 185.100.200.5 --non-interactive
+sudo bash server-bootstrap.sh --mode relay --gate-address 185.100.200.5 --non-interactive
 ```
 
 ### Step-by-step component selection
