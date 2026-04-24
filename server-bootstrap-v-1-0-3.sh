@@ -18,7 +18,7 @@ IFS=$'\n\t'
 # SECTION 1 · CONSTANTS & GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="1.0.3"
+readonly SCRIPT_VERSION="1.0.4"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/server-bootstrap.log"
 readonly CONFIG_FILE="/etc/server-bootstrap.conf"
@@ -60,6 +60,7 @@ declare -A CHANGELOG=(
     ["1.0.1"]="HAProxy relay mode: SNI-based routing, RELAY_ADDRESS/GATE_PORT params, PPA install chain"
     ["1.0.2"]="allowed.lst: URL fetch mode (GitHub raw) with If-Modified-Since, cron 3x daily + 10/16/22h refresh. State engine: resume interrupted installs, per-step tracking. Uninstall menu per component."
     ["1.0.3"]="Version tracking in logs (session header). Changelog display on upgrade. Soft-update mode: backup configs before re-running changed components, merge/restore on failure."
+    ["1.0.4"]="HAProxy relay: silent-drop backends (no blackhole server), daemon+nbthread+tunnel timeout, stats HTTP page :8404, systemd Restart=always drop-in, graceful reload. Gate mode: HAProxy-native blocking replaces mobile443-filter (blocked.lst+allowed.lst on gate). Monitoring: Prometheus+Grafana Docker Compose stack with HAProxy+Node Exporter dashboards, provisioned at /opt/monitoring."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,7 +111,7 @@ print_header() {
     echo -e "${BOLD}${BLUE}"
     cat <<'EOF'
   ╔═══════════════════════════════════════════════════════╗
-  ║         SERVER BOOTSTRAP  ·  v1.0.0                  ║
+  ║         SERVER BOOTSTRAP  ·  v1.0.4                  ║
   ║         Debian 12+ / Ubuntu 22.04+  |  root only     ║
   ╚═══════════════════════════════════════════════════════╝
 EOF
@@ -617,13 +618,21 @@ setup_ufw() {
 
     # Mode-specific rules
     case "$mode" in
-        node|gate)
+        node)
+            ufw allow 443/tcp  comment 'HTTPS/Xray'  &>/dev/null
+            ufw allow 80/tcp   comment 'HTTP'         &>/dev/null
+            ufw allow 8443/tcp comment 'Alt-HTTPS'    &>/dev/null
+            ;;
+        gate)
             ufw allow 443/tcp  comment 'HTTPS/Xray'  &>/dev/null
             ufw allow 80/tcp   comment 'HTTP'         &>/dev/null
             ufw allow 8443/tcp comment 'Alt-HTTPS'    &>/dev/null
             ;;
         relay)
-            ufw allow 443/tcp  comment 'HAProxy TCP proxy' &>/dev/null
+            ufw allow "${RELAY_PORT:-443}/tcp" comment 'HAProxy relay' &>/dev/null
+            ;;
+        monitoring)
+            ufw allow 3000/tcp comment 'Grafana' &>/dev/null
             ;;
         base|*)
             # Only SSH
@@ -876,48 +885,72 @@ _ask_relay_params() {
     log_info "GATE   : ${GATE_ADDRESS}:${GATE_PORT}"
 }
 
-# ── Write HAProxy config ──────────────────────────────────────────────────────
+# ── Write HAProxy config (relay mode) ────────────────────────────────────────
 _write_haproxy_cfg() {
     local haproxy_cfg="/etc/haproxy/haproxy.cfg"
     backup_file "$haproxy_cfg"
 
-    # Ensure list files exist (haproxy will fail if referenced files are missing)
+    # Ensure list files and socket dir exist before writing config
+    mkdir -p /var/run/haproxy
     touch /etc/haproxy/blocked.lst /etc/haproxy/allowed.lst
 
     cat > "$haproxy_cfg" <<EOF
 global
     log /dev/log local0
-    maxconn 50000
-    stats socket /var/run/haproxy/admin.sock mode 660 level admin
+    maxconn 100000
+    daemon
+    nbthread auto
+    stats socket /var/run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+    stats timeout 30s
 
 defaults
     mode tcp
     timeout connect 10s
-    timeout client  5m
-    timeout server  5m
+    timeout client  1h
+    timeout server  1h
+    timeout tunnel  1h
     log             global
     option          tcplog
+    option          dontlognull
+    retries         3
 
+# ── Stats HTTP page (localhost only, port 8404) ───────────────────────────────
+frontend ft_stats
+    bind 127.0.0.1:8404
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+    stats show-legends
+    stats show-node
+    no log
+
+# ── Main inbound frontend ─────────────────────────────────────────────────────
 frontend ft_inbound
-    bind ${RELAY_ADDRESS}:${RELAY_PORT}
+    bind *:${RELAY_PORT}
     tcp-request inspect-delay 5s
     tcp-request content accept if { req_ssl_hello_type 1 }
+
+    # Priority: blocked list first, then allowlist check
     use_backend bk_blocked if { src -f /etc/haproxy/blocked.lst }
-    use_backend bk_ignored if !{ src -f /etc/haproxy/allowed.lst }
+    use_backend bk_ignored  if !{ src -f /etc/haproxy/allowed.lst }
     default_backend bk_upstream
 
+# ── Silent-drop backends (no server = HAProxy closes silently, logs backend name)
 backend bk_blocked
-    server blackhole 127.0.0.1:1
+    timeout connect 1s
 
 backend bk_ignored
-    server blackhole 127.0.0.1:1
+    timeout connect 1s
 
+# ── Upstream gate ─────────────────────────────────────────────────────────────
 backend bk_upstream
     option tcp-check
+    timeout check 5s
     server upstream ${GATE_ADDRESS}:${GATE_PORT} send-proxy-v2 check inter 10s rise 2 fall 3
 EOF
 
-    log_info "HAProxy config written"
+    log_info "HAProxy relay config written (→ ${GATE_ADDRESS}:${GATE_PORT})"
 }
 
 # ── Blocklist update script ───────────────────────────────────────────────────
@@ -1201,12 +1234,34 @@ setup_haproxy() {
     _write_logrotate
     _write_cron
 
-    # 7. Validate config then restart
+    # 7. Ensure /var/run/haproxy exists (stats socket dir)
+    mkdir -p /var/run/haproxy
+    chown haproxy:haproxy /var/run/haproxy 2>/dev/null || true
+
+    # 8. Systemd drop-in: auto-restart on failure
+    mkdir -p /etc/systemd/system/haproxy.service.d
+    cat > /etc/systemd/system/haproxy.service.d/override.conf <<'OVERRIDE'
+[Service]
+Restart=always
+RestartSec=3s
+LimitNOFILE=1048576
+RuntimeDirectory=haproxy
+RuntimeDirectoryMode=0750
+OVERRIDE
+    systemctl daemon-reload &>/dev/null
+
+    # 9. Validate config then start (graceful reload if already running)
     log_info "Validating HAProxy config..."
     if haproxy -c -f /etc/haproxy/haproxy.cfg; then
         systemctl enable haproxy &>/dev/null
-        systemctl restart haproxy
-        log_ok "HAProxy 2.8 started (${RELAY_ADDRESS}:${RELAY_PORT} → ${GATE_ADDRESS}:${GATE_PORT})"
+        if systemctl is-active --quiet haproxy 2>/dev/null; then
+            systemctl reload haproxy
+            log_ok "HAProxy reloaded gracefully (zero downtime)"
+        else
+            systemctl restart haproxy
+            log_ok "HAProxy started"
+        fi
+        log_ok "HAProxy 2.8 running (${RELAY_ADDRESS}:${RELAY_PORT} → ${GATE_ADDRESS}:${GATE_PORT})"
         systemctl status haproxy --no-pager -l 2>/dev/null | head -10 | sed 's/^/    /'
         STEP_STATUS["haproxy"]="OK"
     else
@@ -1217,7 +1272,7 @@ setup_haproxy() {
         return 1
     fi
 
-    # 8. Show useful hints
+    # 10. Show useful hints
     echo ""
     log_info "Useful commands:"
     echo -e "    ${CYAN}# Live HAProxy log${RESET}"
@@ -1226,10 +1281,185 @@ setup_haproxy() {
     echo    "    tail -f /var/log/haproxy-blocked.log"
     echo -e "    ${CYAN}# Ignored IPs log${RESET}"
     echo    "    tail -f /var/log/haproxy-ignored.log"
+    echo -e "    ${CYAN}# Stats page (localhost)${RESET}"
+    echo    "    curl -s http://127.0.0.1:8404/stats"
     echo -e "    ${CYAN}# Stats via socket${RESET}"
     echo    "    echo 'show info' | socat stdio /var/run/haproxy/admin.sock"
     echo -e "    ${CYAN}# Force update lists now${RESET}"
     echo    "    /usr/local/bin/update_blocklist.sh && /usr/local/bin/update_allowlist.sh && systemctl reload haproxy"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 11b · HAPROXY GATE MODE
+#
+# Architecture:
+#   Relay → GATE_LISTEN_PORT (HAProxy on gate)
+#               ├─ bk_blocked → silent drop  (government IPs / scanners)
+#               ├─ bk_ignored → silent drop  (NOT in Russian operator allowlist)
+#               └─ bk_xray   → 127.0.0.1:XRAY_PORT  accept-proxy
+#
+# Lists (same update scripts as relay mode):
+#   /etc/haproxy/blocked.lst  — government networks + antiscanner CIDRs
+#   /etc/haproxy/allowed.lst  — Russian mobile/ISP operator CIDRs
+# ─────────────────────────────────────────────────────────────────────────────
+
+GATE_LISTEN_PORT="9443"   # port HAProxy listens on (relay sends here)
+XRAY_PORT="443"            # port remnanode/xray listens on locally
+
+_write_haproxy_cfg_gate() {
+    local haproxy_cfg="/etc/haproxy/haproxy.cfg"
+    backup_file "$haproxy_cfg"
+
+    mkdir -p /var/run/haproxy
+    touch /etc/haproxy/blocked.lst /etc/haproxy/allowed.lst
+
+    cat > "$haproxy_cfg" <<EOF
+global
+    log /dev/log local0
+    maxconn 100000
+    daemon
+    nbthread auto
+    stats socket /var/run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+    stats timeout 30s
+
+defaults
+    mode tcp
+    timeout connect 10s
+    timeout client  1h
+    timeout server  1h
+    timeout tunnel  1h
+    log             global
+    option          tcplog
+    option          dontlognull
+    retries         3
+
+# ── Stats page (localhost only) ───────────────────────────────────────────────
+frontend ft_stats
+    bind 127.0.0.1:8404
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+    stats show-legends
+    stats show-node
+    no log
+
+# ── Gate inbound (from relay, carries PROXY protocol v2) ─────────────────────
+frontend ft_gate
+    bind *:${GATE_LISTEN_PORT} accept-proxy
+
+    use_backend bk_blocked if { src -f /etc/haproxy/blocked.lst }
+    use_backend bk_ignored  if !{ src -f /etc/haproxy/allowed.lst }
+    default_backend bk_xray
+
+# ── Silent-drop backends ──────────────────────────────────────────────────────
+backend bk_blocked
+    timeout connect 1s
+
+backend bk_ignored
+    timeout connect 1s
+
+# ── Local xray/remnanode ──────────────────────────────────────────────────────
+backend bk_xray
+    option tcp-check
+    timeout check 5s
+    server xray 127.0.0.1:${XRAY_PORT} send-proxy-v2 check inter 10s rise 2 fall 3
+EOF
+
+    log_info "HAProxy gate config written (listen :${GATE_LISTEN_PORT} → 127.0.0.1:${XRAY_PORT})"
+}
+
+setup_haproxy_gate() {
+    log_step "Configuring HAProxy 2.8 (Gate mode — HAProxy-native blocking)"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would install HAProxy 2.8 for gate mode"
+        log_dry "Would configure: *:${GATE_LISTEN_PORT} (accept-proxy) → 127.0.0.1:${XRAY_PORT}"
+        log_dry "Would create: blocked.lst, allowed.lst, update scripts, cron"
+        STEP_STATUS["haproxy_gate"]="DRY"
+        return 0
+    fi
+
+    # Ask for ports if interactive
+    if [[ "$NON_INTERACTIVE" == false ]]; then
+        read -rp "  Gate listen port (relay sends here) [${GATE_LISTEN_PORT}]: " _glp
+        GATE_LISTEN_PORT="${_glp:-$GATE_LISTEN_PORT}"
+        _validate_port "$GATE_LISTEN_PORT" || { log_error "Invalid port: ${GATE_LISTEN_PORT}"; exit 1; }
+
+        read -rp "  Local xray/remnanode port [${XRAY_PORT}]: " _xp
+        XRAY_PORT="${_xp:-$XRAY_PORT}"
+        _validate_port "$XRAY_PORT" || { log_error "Invalid port: ${XRAY_PORT}"; exit 1; }
+    fi
+
+    log_info "Gate HAProxy: *:${GATE_LISTEN_PORT} (accept-proxy) → 127.0.0.1:${XRAY_PORT}"
+
+    # 1. Install HAProxy 2.8
+    _install_haproxy_28
+
+    # 2. Write helper scripts (same as relay mode)
+    _write_update_blocklist
+    _write_update_allowlist
+    _write_analyze_logs
+
+    # 3. Write gate config
+    _write_haproxy_cfg_gate
+
+    # 4. Fetch initial lists
+    log_info "Fetching initial blocklist..."
+    /usr/local/bin/update_blocklist.sh || log_warn "Blocklist fetch failed — continuing with empty list"
+
+    local allowlist_label="(may take 2-3 min via whois)"
+    [[ -n "${ALLOWED_LST_URL:-}" ]] && allowlist_label="from URL"
+    log_info "Fetching initial allowlist ${allowlist_label}..."
+    /usr/local/bin/update_allowlist.sh || log_warn "Allowlist fetch failed — continuing with empty list"
+
+    # 5. Logging + logrotate + cron
+    _write_rsyslog_conf
+    _write_logrotate
+    _write_cron
+
+    # 6. Systemd drop-in: auto-restart
+    mkdir -p /etc/systemd/system/haproxy.service.d
+    cat > /etc/systemd/system/haproxy.service.d/override.conf <<'OVERRIDE'
+[Service]
+Restart=always
+RestartSec=3s
+LimitNOFILE=1048576
+RuntimeDirectory=haproxy
+RuntimeDirectoryMode=0750
+OVERRIDE
+    systemctl daemon-reload &>/dev/null
+
+    # 7. Validate and start
+    mkdir -p /var/run/haproxy
+    chown haproxy:haproxy /var/run/haproxy 2>/dev/null || true
+
+    if haproxy -c -f /etc/haproxy/haproxy.cfg; then
+        systemctl enable haproxy &>/dev/null
+        if systemctl is-active --quiet haproxy 2>/dev/null; then
+            systemctl reload haproxy
+            log_ok "HAProxy gate reloaded gracefully"
+        else
+            systemctl restart haproxy
+            log_ok "HAProxy gate started"
+        fi
+        systemctl status haproxy --no-pager -l 2>/dev/null | head -10 | sed 's/^/    /'
+        STEP_STATUS["haproxy_gate"]="OK"
+    else
+        log_error "HAProxy gate config validation FAILED — reverting backup"
+        local bak="${BACKUP_DIR}/haproxy.cfg.${TIMESTAMP}.bak"
+        [[ -f "$bak" ]] && cp -a "$bak" /etc/haproxy/haproxy.cfg
+        STEP_STATUS["haproxy_gate"]="FAILED"
+        return 1
+    fi
+
+    echo ""
+    log_info "Gate HAProxy hints:"
+    echo -e "    ${CYAN}# Stats page${RESET}"
+    echo    "    curl -s http://127.0.0.1:8404/stats"
+    echo -e "    ${CYAN}# Force update lists${RESET}"
+    echo    "    /usr/local/bin/update_blocklist.sh && /usr/local/bin/update_allowlist.sh && systemctl reload haproxy"
+    echo -e "    ${CYAN}# Relay should send to this server on port ${GATE_LISTEN_PORT} with send-proxy-v2${RESET}"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1407,6 +1637,390 @@ install_docker() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SECTION 15b · MONITORING STACK (Prometheus + Grafana)
+#
+# Stack (Docker Compose at /opt/monitoring):
+#   prometheus     — scrapes node_exporter + haproxy_exporter, port 9090 (localhost)
+#   grafana        — dashboards, port 3000 (public, password-protected)
+#   node_exporter  — system metrics, port 9100 (localhost)
+#   haproxy_exporter — HAProxy stats via socket, port 9101 (localhost)
+#
+# Grafana admin password: auto-generated, saved to /opt/monitoring/.grafana_password
+# ─────────────────────────────────────────────────────────────────────────────
+
+MONITORING_DIR="/opt/monitoring"
+MONITORING_GRAFANA_PORT="3000"
+MONITORING_PROMETHEUS_PORT="9090"
+
+install_monitoring() {
+    log_step "Installing monitoring stack (Prometheus + Grafana)"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would install: prometheus, grafana, node_exporter, haproxy_exporter via Docker Compose"
+        log_dry "Would create: ${MONITORING_DIR}/docker-compose.yml + provisioning files"
+        log_dry "Would open UFW port ${MONITORING_GRAFANA_PORT}/tcp for Grafana"
+        STEP_STATUS["monitoring"]="DRY"
+        return 0
+    fi
+
+    # Docker is required
+    if ! command -v docker &>/dev/null; then
+        log_info "Docker not found — installing..."
+        install_docker
+    fi
+    if ! docker compose version &>/dev/null 2>&1; then
+        log_error "Docker Compose not available — cannot install monitoring stack"
+        STEP_STATUS["monitoring"]="FAILED"
+        return 1
+    fi
+
+    mkdir -p "${MONITORING_DIR}/grafana/provisioning/datasources"
+    mkdir -p "${MONITORING_DIR}/grafana/provisioning/dashboards"
+    mkdir -p "${MONITORING_DIR}/grafana/dashboards"
+    mkdir -p "${MONITORING_DIR}/prometheus"
+
+    # ── Generate random Grafana admin password ────────────────────────────────
+    local grafana_pass
+    if [[ -f "${MONITORING_DIR}/.grafana_password" ]]; then
+        grafana_pass="$(cat "${MONITORING_DIR}/.grafana_password")"
+        log_info "Using existing Grafana password from ${MONITORING_DIR}/.grafana_password"
+    else
+        grafana_pass="$(tr -dc 'A-Za-z0-9!@#%^&*' < /dev/urandom | head -c 20 2>/dev/null || echo 'ChangeMe123!')"
+        echo "$grafana_pass" > "${MONITORING_DIR}/.grafana_password"
+        chmod 600 "${MONITORING_DIR}/.grafana_password"
+    fi
+
+    # ── Docker Compose ────────────────────────────────────────────────────────
+    cat > "${MONITORING_DIR}/docker-compose.yml" <<EOF
+version: '3.8'
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MONITORING_PROMETHEUS_PORT}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=30d'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:${MONITORING_GRAFANA_PORT}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${grafana_pass}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:${MONITORING_GRAFANA_PORT}
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+    depends_on:
+      - prometheus
+
+  node_exporter:
+    image: prom/node-exporter:latest
+    container_name: node_exporter
+    restart: unless-stopped
+    pid: host
+    network_mode: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)(\\$\$|/)'
+      - '--web.listen-address=127.0.0.1:9100'
+
+  haproxy_exporter:
+    image: prom/haproxy-exporter:latest
+    container_name: haproxy_exporter
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /var/run/haproxy:/var/run/haproxy:ro
+    command:
+      - '--haproxy.scrape-uri=unix:/var/run/haproxy/admin.sock'
+      - '--web.listen-address=127.0.0.1:9101'
+
+volumes:
+  prometheus_data:
+  grafana_data:
+EOF
+
+    # ── Prometheus config ─────────────────────────────────────────────────────
+    cat > "${MONITORING_DIR}/prometheus/prometheus.yml" <<'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node'
+    static_configs:
+      - targets: ['localhost:9100']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: '{{ hostname }}'
+
+  - job_name: 'haproxy'
+    static_configs:
+      - targets: ['localhost:9101']
+EOF
+
+    # ── Grafana datasource provisioning ──────────────────────────────────────
+    cat > "${MONITORING_DIR}/grafana/provisioning/datasources/prometheus.yml" <<'EOF'
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+EOF
+
+    # ── Grafana dashboard provisioning ────────────────────────────────────────
+    cat > "${MONITORING_DIR}/grafana/provisioning/dashboards/default.yml" <<'EOF'
+apiVersion: 1
+providers:
+  - name: 'default'
+    orgId: 1
+    folder: 'Server Bootstrap'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+EOF
+
+    # ── HAProxy dashboard ─────────────────────────────────────────────────────
+    cat > "${MONITORING_DIR}/grafana/dashboards/haproxy.json" <<'DASHBOARD'
+{
+  "title": "HAProxy Overview",
+  "uid": "haproxy-overview",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "type": "stat", "id": 1, "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "title": "Active Connections",
+      "targets": [{"expr": "haproxy_process_current_connections", "datasource": "Prometheus"}],
+      "options": {"colorMode": "background", "graphMode": "area"},
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [
+        {"color": "green", "value": null}, {"color": "yellow", "value": 10000}, {"color": "red", "value": 40000}
+      ]}}}
+    },
+    {
+      "type": "stat", "id": 2, "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "title": "Sessions/sec",
+      "targets": [{"expr": "rate(haproxy_process_sessions_total[1m])", "datasource": "Prometheus"}],
+      "options": {"colorMode": "background", "graphMode": "area"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}}
+    },
+    {
+      "type": "stat", "id": 3, "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "title": "Bytes In/s",
+      "targets": [{"expr": "rate(haproxy_process_bytes_in_total[1m])", "datasource": "Prometheus"}],
+      "options": {"colorMode": "value"},
+      "fieldConfig": {"defaults": {"unit": "Bps"}}
+    },
+    {
+      "type": "stat", "id": 4, "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "title": "Bytes Out/s",
+      "targets": [{"expr": "rate(haproxy_process_bytes_out_total[1m])", "datasource": "Prometheus"}],
+      "options": {"colorMode": "value"},
+      "fieldConfig": {"defaults": {"unit": "Bps"}}
+    },
+    {
+      "type": "stat", "id": 5, "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "title": "Backend bk_upstream Status",
+      "targets": [{"expr": "haproxy_backend_status{proxy=\"bk_upstream\"}", "datasource": "Prometheus"}],
+      "options": {"colorMode": "background"},
+      "fieldConfig": {"defaults": {"mappings": [
+        {"options": {"1": {"text": "UP", "color": "green"}}, "type": "value"},
+        {"options": {"0": {"text": "DOWN", "color": "red"}}, "type": "value"}
+      ]}}
+    },
+    {
+      "type": "timeseries", "id": 6, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "title": "Connections over time",
+      "targets": [
+        {"expr": "haproxy_process_current_connections", "legendFormat": "Active", "datasource": "Prometheus"},
+        {"expr": "rate(haproxy_process_sessions_total[1m])", "legendFormat": "Sessions/s", "datasource": "Prometheus"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "type": "timeseries", "id": 7, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "title": "Traffic (bytes/s)",
+      "targets": [
+        {"expr": "rate(haproxy_process_bytes_in_total[1m])", "legendFormat": "In", "datasource": "Prometheus"},
+        {"expr": "rate(haproxy_process_bytes_out_total[1m])", "legendFormat": "Out", "datasource": "Prometheus"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "Bps"}}
+    },
+    {
+      "type": "timeseries", "id": 8, "gridPos": {"h": 8, "w": 24, "x": 0, "y": 12},
+      "title": "Backend connections (upstream / blocked / ignored)",
+      "targets": [
+        {"expr": "rate(haproxy_backend_sessions_total{proxy=\"bk_upstream\"}[1m])", "legendFormat": "upstream", "datasource": "Prometheus"},
+        {"expr": "rate(haproxy_backend_sessions_total{proxy=\"bk_blocked\"}[1m])", "legendFormat": "blocked", "datasource": "Prometheus"},
+        {"expr": "rate(haproxy_backend_sessions_total{proxy=\"bk_ignored\"}[1m])", "legendFormat": "ignored", "datasource": "Prometheus"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps"}}
+    }
+  ]
+}
+DASHBOARD
+
+    # ── Node Exporter dashboard ───────────────────────────────────────────────
+    cat > "${MONITORING_DIR}/grafana/dashboards/node.json" <<'DASHBOARD'
+{
+  "title": "Node Overview",
+  "uid": "node-overview",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "type": "gauge", "id": 1, "gridPos": {"h": 6, "w": 6, "x": 0, "y": 0},
+      "title": "CPU Usage %",
+      "targets": [{"expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[1m])) * 100)", "datasource": "Prometheus"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100,
+        "thresholds": {"steps": [{"color":"green","value":null},{"color":"yellow","value":70},{"color":"red","value":90}]}}}
+    },
+    {
+      "type": "gauge", "id": 2, "gridPos": {"h": 6, "w": 6, "x": 6, "y": 0},
+      "title": "Memory Usage %",
+      "targets": [{"expr": "100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)", "datasource": "Prometheus"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100,
+        "thresholds": {"steps": [{"color":"green","value":null},{"color":"yellow","value":80},{"color":"red","value":95}]}}}
+    },
+    {
+      "type": "stat", "id": 3, "gridPos": {"h": 6, "w": 6, "x": 12, "y": 0},
+      "title": "Load Average (1m)",
+      "targets": [{"expr": "node_load1", "datasource": "Prometheus"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "type": "stat", "id": 4, "gridPos": {"h": 6, "w": 6, "x": 18, "y": 0},
+      "title": "Uptime",
+      "targets": [{"expr": "node_time_seconds - node_boot_time_seconds", "datasource": "Prometheus"}],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "type": "timeseries", "id": 5, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "title": "CPU over time",
+      "targets": [{"expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[1m])) * 100)", "legendFormat": "CPU %", "datasource": "Prometheus"}],
+      "fieldConfig": {"defaults": {"unit": "percent"}}
+    },
+    {
+      "type": "timeseries", "id": 6, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+      "title": "Network traffic",
+      "targets": [
+        {"expr": "rate(node_network_receive_bytes_total{device!~\"lo|docker.*|veth.*\"}[1m])", "legendFormat": "In {{device}}", "datasource": "Prometheus"},
+        {"expr": "rate(node_network_transmit_bytes_total{device!~\"lo|docker.*|veth.*\"}[1m])", "legendFormat": "Out {{device}}", "datasource": "Prometheus"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "Bps"}}
+    },
+    {
+      "type": "timeseries", "id": 7, "gridPos": {"h": 8, "w": 24, "x": 0, "y": 14},
+      "title": "Disk I/O",
+      "targets": [
+        {"expr": "rate(node_disk_read_bytes_total[1m])", "legendFormat": "Read {{device}}", "datasource": "Prometheus"},
+        {"expr": "rate(node_disk_written_bytes_total[1m])", "legendFormat": "Write {{device}}", "datasource": "Prometheus"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "Bps"}}
+    }
+  ]
+}
+DASHBOARD
+
+    # ── UFW: open Grafana port ────────────────────────────────────────────────
+    if command -v ufw &>/dev/null; then
+        ufw allow "${MONITORING_GRAFANA_PORT}/tcp" comment 'Grafana dashboard' &>/dev/null || true
+        log_info "UFW: opened port ${MONITORING_GRAFANA_PORT}/tcp for Grafana"
+    fi
+
+    # ── Cron watchdog: restart if containers are down ─────────────────────────
+    cat > /etc/cron.d/monitoring-watchdog <<EOF
+# server-bootstrap: monitoring stack watchdog
+*/5 * * * * root cd ${MONITORING_DIR} && docker compose ps --quiet | grep -q . || docker compose up -d >> /var/log/monitoring-watchdog.log 2>&1
+EOF
+
+    # ── Start the stack ───────────────────────────────────────────────────────
+    log_info "Starting monitoring stack..."
+    cd "${MONITORING_DIR}"
+    docker compose pull --quiet 2>/dev/null || log_warn "Could not pull latest images — using cached"
+    docker compose up -d
+
+    # Wait a moment and check
+    sleep 5
+    if docker compose ps 2>/dev/null | grep -qE "Up|running"; then
+        log_ok "Monitoring stack started"
+        docker compose ps 2>/dev/null | sed 's/^/    /'
+    else
+        log_warn "Some containers may not be running — check: docker compose -f ${MONITORING_DIR}/docker-compose.yml ps"
+    fi
+
+    STEP_STATUS["monitoring"]="OK"
+
+    echo ""
+    log_ok "Monitoring stack ready:"
+    local server_ip
+    server_ip="$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo 'YOUR_IP')"
+    echo -e "    ${CYAN}Grafana   :${RESET} http://${server_ip}:${MONITORING_GRAFANA_PORT}"
+    echo -e "    ${CYAN}Login     :${RESET} admin / $(cat "${MONITORING_DIR}/.grafana_password")"
+    echo -e "    ${CYAN}Prometheus:${RESET} http://127.0.0.1:${MONITORING_PROMETHEUS_PORT} (localhost only)"
+    echo -e "    ${CYAN}Password  :${RESET} saved to ${MONITORING_DIR}/.grafana_password"
+    echo ""
+}
+
+uninstall_monitoring() {
+    log_step "Uninstalling monitoring stack"
+    [[ "$DRY_RUN" == true ]] && { log_dry "Would stop and remove monitoring Docker Compose stack + cron"; return 0; }
+
+    if [[ -f "${MONITORING_DIR}/docker-compose.yml" ]]; then
+        cd "${MONITORING_DIR}"
+        docker compose down --volumes 2>/dev/null || true
+    fi
+
+    rm -f /etc/cron.d/monitoring-watchdog
+    rm -rf "${MONITORING_DIR}"
+
+    if command -v ufw &>/dev/null; then
+        ufw delete allow "${MONITORING_GRAFANA_PORT}/tcp" &>/dev/null || true
+    fi
+
+    state_save_step "monitoring" "REMOVED"
+    log_ok "Monitoring stack removed"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SECTION 16 · STATUS CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1458,6 +2072,24 @@ check_status_all() {
     else
         echo "    not installed"
     fi
+
+    echo -e "\n  ${BOLD}Monitoring stack:${RESET}"
+    if [[ -f "${MONITORING_DIR}/docker-compose.yml" ]]; then
+        local server_ip
+        server_ip="$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo '?')"
+        if command -v docker &>/dev/null; then
+            docker compose -f "${MONITORING_DIR}/docker-compose.yml" ps --format '    {{.Name}}  {{.Status}}' 2>/dev/null \
+                || echo "    (cannot reach Docker)"
+        fi
+        if [[ -f "${MONITORING_DIR}/.grafana_password" ]]; then
+            echo -e "    Grafana: http://${server_ip}:${MONITORING_GRAFANA_PORT}  (admin / $(cat "${MONITORING_DIR}/.grafana_password"))"
+        else
+            echo -e "    Grafana: http://${server_ip}:${MONITORING_GRAFANA_PORT}"
+        fi
+    else
+        echo "    not installed (use custom mode → Install monitoring)"
+    fi
+
     print_separator
 }
 
@@ -1759,6 +2391,33 @@ run_soft_update() {
         fi
     fi
 
+    # ── haproxy_gate ──
+    if [[ "${_STATE[haproxy_gate]:-}" == "OK" ]]; then
+        log_step "Updating: haproxy_gate"
+        local bak; bak=$(_soft_backup "haproxy_gate" /etc/haproxy)
+        state_save_step "haproxy_gate" "UPDATING"
+        if setup_haproxy_gate; then
+            state_save_step "haproxy_gate" "OK"
+            log_ok "haproxy_gate updated"
+        else
+            log_error "haproxy_gate update failed — restoring backup"
+            _soft_restore "$bak" /etc/haproxy
+            state_save_step "haproxy_gate" "FAILED"
+        fi
+    fi
+
+    # ── monitoring ──
+    if [[ "${_STATE[monitoring]:-}" == "OK" ]]; then
+        log_step "Updating: monitoring stack"
+        state_save_step "monitoring" "UPDATING"
+        if install_monitoring; then
+            state_save_step "monitoring" "OK"
+            log_ok "monitoring updated"
+        else
+            state_save_step "monitoring" "FAILED"
+        fi
+    fi
+
     # ── remnanode / selfsteal / mobile443: re-run without data wipe ──
     for step in remnanode selfsteal mobile443; do
         if [[ "${_STATE[$step]:-}" == "OK" ]]; then
@@ -1941,7 +2600,7 @@ run_uninstall() {
     local components=()
     local labels=()
 
-    for step in haproxy fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network; do
+    for step in haproxy haproxy_gate monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network; do
         local st="${_STATE[$step]:-unknown}"
         if [[ "$st" == "OK" || "$st" == "SKIPPED(resume)" ]]; then
             components+=("$step")
@@ -1957,7 +2616,7 @@ run_uninstall() {
     if [[ ${#components[@]} -eq 0 ]]; then
         log_warn "No installed components found in state file"
         log_info "You can still uninstall manually by selecting components below"
-        components=(haproxy fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network)
+        components=(haproxy haproxy_gate monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network)
         for c in "${components[@]}"; do labels+=("$c"); done
     fi
 
@@ -1984,6 +2643,7 @@ run_uninstall() {
             log_warn "Full wipe selected — removing ALL components"
             read -rp "  Are you sure? This cannot be undone. [yes/N]: " confirm
             [[ "${confirm,,}" != "yes" ]] && { log_info "Cancelled"; return 0; }
+            uninstall_monitoring
             uninstall_haproxy
             uninstall_remnanode
             uninstall_selfsteal
@@ -2001,6 +2661,8 @@ run_uninstall() {
                 log_info "Uninstalling: ${target}"
                 case "$target" in
                     haproxy)       uninstall_haproxy    ;;
+                    haproxy_gate)  uninstall_haproxy    ;;
+                    monitoring)    uninstall_monitoring ;;
                     fail2ban)      uninstall_fail2ban   ;;
                     ufw)           uninstall_ufw        ;;
                     remnanode)     uninstall_remnanode  ;;
@@ -2106,6 +2768,7 @@ run_custom() {
     _ask "Install selfsteal?"     && { SKIP_SELFSTEAL=false; install_selfsteal; }
     _ask "Install Docker?"        && install_docker
     _ask "Create swap?"           && setup_swap
+    _ask "Install monitoring stack (Prometheus + Grafana)?" && install_monitoring
 
     STEP_STATUS["mode"]="custom/OK"
 }
@@ -2450,7 +3113,7 @@ main "$@"
 # 4.  [ ] Provider presets (Hetzner, Vultr, DigitalOcean network quirks)
 # 5.  [ ] IPv6 dual-stack support in UFW rules
 # 6.  [ ] Automatic SSH key injection (from GitHub/URL)
-# 7.  [ ] Monitoring stack: Prometheus node-exporter + Grafana Alloy
+# 7.  [x] Monitoring stack: Prometheus + Grafana + node_exporter + haproxy_exporter — DONE in v1.0.4
 # 8.  [ ] Kernel BBR2 / TCP optimization tuning for specific workloads
 # 9.  [ ] GitHub Actions / CI self-test (shellcheck + bats)
 # 10. [ ] Web dashboard for status (simple Flask / static HTML)
