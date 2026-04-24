@@ -8,7 +8,7 @@
 #  Usage (non-interactive): bash server-bootstrap.sh --mode node [--options]
 #
 #  Author:  Kitsura VPN
-#  Version: 1.0.2
+#  Version: 1.0.0
 # ==============================================================================
 
 set -euo pipefail
@@ -18,11 +18,10 @@ IFS=$'\n\t'
 # SECTION 1 · CONSTANTS & GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="1.0.2"
+readonly SCRIPT_VERSION="1.0.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/server-bootstrap.log"
 readonly CONFIG_FILE="/etc/server-bootstrap.conf"
-readonly STATE_FILE="/etc/server-bootstrap.state"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-custom-network.conf"
 readonly BACKUP_DIR="/var/backups/server-bootstrap"
 readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
@@ -33,14 +32,8 @@ VERBOSE=false
 NON_INTERACTIVE=false
 SKIP_SELFSTEAL=false
 SKIP_UPDATE=false
-RESUME=false       # Resume interrupted install (skip already-OK steps)
-UNINSTALL=false    # Uninstall mode
 MODE=""         # base | node | gate | relay | custom
 GATE_ADDRESS="" # used in relay mode
-RELAY_ADDRESS=""  # Relay: this server's IP (auto-detected if empty)
-RELAY_PORT="443"  # Relay: port haproxy binds on
-GATE_PORT="9443"  # Relay: port on gate (recommended: NOT 443)
-ALLOWED_LST_URL="https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/allowed.lst"  # Relay: URL to fetch allowed.lst; empty = use whois/RADB
 
 # ── Auto-detect pipe mode (curl URL | bash kills stdin) ───────────────────────
 # If stdin is NOT a terminal, force non-interactive to protect all `read` calls.
@@ -667,549 +660,91 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 11 · HAPROXY (Relay/router mode)
 # ─────────────────────────────────────────────────────────────────────────────
-#
-# Architecture:
-#   Client → RELAY_ADDRESS:RELAY_PORT (HAProxy)
-#               ├─ bk_blocked  → blackhole  (government IPs / scanners)
-#               ├─ bk_ignored  → blackhole  (NOT in Russian operator allowlist)
-#               └─ bk_upstream → GATE_ADDRESS:GATE_PORT  send-proxy-v2
-#
-# Lists:
-#   /etc/haproxy/blocked.lst  — government networks + antiscanner CIDRs
-#   /etc/haproxy/allowed.lst  — Russian mobile/ISP operator CIDRs (whois RADB)
-#
-# Cron: daily 04:20 — analyze logs → update lists → reload haproxy
-# ─────────────────────────────────────────────────────────────────────────────
 
 # Validate IPv4 address
 _validate_ip() {
     local ip="$1"
     local re='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
-    [[ $ip =~ $re ]] || return 1
-    local IFS='.'
-    read -r o1 o2 o3 o4 <<< "$ip"
-    for o in $o1 $o2 $o3 $o4; do (( o <= 255 )) || return 1; done
+    if [[ ! $ip =~ $re ]]; then return 1; fi
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    for o in $o1 $o2 $o3 $o4; do
+        (( o <= 255 )) || return 1
+    done
     return 0
 }
 
-# Validate port (1-65535)
-_validate_port() {
-    local p="$1"
-    [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
-}
+setup_haproxy() {
+    log_step "Configuring HAProxy (Relay/router mode)"
+    install_packages haproxy
 
-# ── Install HAProxy 2.8 with robust fallback (no hard PPA dependency) ────────
-_install_haproxy_28() {
-    log_info "Installing HAProxy 2.8.*"
-
-    # Check if already correct version
-    if command -v haproxy &>/dev/null; then
-        local ver
-        ver="$(haproxy -v 2>/dev/null | head -1 | grep -oP '(?<=version )\d+\.\d+')"
-        if [[ "$ver" == "2.8" ]]; then
-            log_ok "HAProxy 2.8 already installed"
-            return 0
-        fi
-        log_info "Upgrading HAProxy (current: ${ver}) → 2.8"
-    fi
-
-    install_packages software-properties-common apt-transport-https
-
-    # 1) Try distro repositories first (works on Ubuntu noble-updates)
-    if apt-cache madison haproxy 2>/dev/null | grep -qE '2\.8\.'; then
-        log_info "HAProxy 2.8 found in distro repository, installing without external PPA"
-        DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy=2.8.\* \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold" && {
-            log_ok "HAProxy installed from distro repo: $(haproxy -v 2>/dev/null | head -1)"
-            return 0
-        }
-        log_warn "Version-pinned install failed from distro repo, trying generic haproxy package"
-        DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold" && {
-            local ver2
-            ver2="$(haproxy -v 2>/dev/null | head -1 | grep -oP '(?<=version )\d+\.\d+' || true)"
-            if [[ "$ver2" == "2.8" ]]; then
-                log_ok "HAProxy installed from distro repo: $(haproxy -v 2>/dev/null | head -1)"
-                return 0
-            fi
-        }
-        log_warn "Distro install did not provide HAProxy 2.8, trying external repository fallback"
-    fi
-
-    # 2) Fallback path for systems where 2.8 is absent in distro repos
-    if [[ "$OS_ID" == "ubuntu" ]]; then
-        log_info "Trying Ubuntu PPA fallback: ppa:vbernat/haproxy-2.8"
-        add-apt-repository ppa:vbernat/haproxy-2.8 -y &>/dev/null || {
-            log_warn "Could not add PPA. Will fallback to generic distro haproxy package."
-            DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy \
-                -o Dpkg::Options::="--force-confdef" \
-                -o Dpkg::Options::="--force-confold"
-            log_ok "HAProxy installed (fallback): $(haproxy -v 2>/dev/null | head -1)"
-            return 0
-        }
-
-        if ! DEBIAN_FRONTEND=noninteractive $PKG_MGR update -qq; then
-            log_warn "PPA update failed (possibly unsupported distro codename). Removing PPA and falling back."
-            rm -f /etc/apt/sources.list.d/vbernat-ubuntu-haproxy-2_8-*.sources \
-                  /etc/apt/sources.list.d/vbernat-ubuntu-haproxy-2_8-*.list 2>/dev/null || true
-            DEBIAN_FRONTEND=noninteractive $PKG_MGR update -qq || true
-            DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy \
-                -o Dpkg::Options::="--force-confdef" \
-                -o Dpkg::Options::="--force-confold"
-            log_ok "HAProxy installed (fallback): $(haproxy -v 2>/dev/null | head -1)"
-            return 0
-        fi
-
-        if DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy=2.8.\* \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold"; then
-            log_ok "HAProxy installed from PPA: $(haproxy -v 2>/dev/null | head -1)"
-            return 0
-        fi
-
-        log_warn "PPA install failed, trying generic distro haproxy package"
-        DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold"
-        log_ok "HAProxy installed (fallback): $(haproxy -v 2>/dev/null | head -1)"
-    else
-        # Debian fallback chain: distro repo first, then haproxy.debian.net
-        log_info "Trying Debian distro repository first"
-        if DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy=2.8.\* \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold"; then
-            log_ok "HAProxy installed from distro repo: $(haproxy -v 2>/dev/null | head -1)"
-            return 0
-        fi
-
-        log_warn "Debian distro repo does not provide HAProxy 2.8, using haproxy.debian.net"
-        curl -fsSL https://haproxy.debian.net/bernat.debian.net.gpg \
-            | gpg --dearmor -o /usr/share/keyrings/haproxy.debian.net.gpg
-
-        echo "deb [signed-by=/usr/share/keyrings/haproxy.debian.net.gpg] \
-https://haproxy.debian.net bookworm-backports-2.8 main" \
-            > /etc/apt/sources.list.d/haproxy.list
-
-        DEBIAN_FRONTEND=noninteractive $PKG_MGR update -qq
-        DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy=2.8.\* \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold"
-
-        log_ok "HAProxy installed from haproxy.debian.net: $(haproxy -v 2>/dev/null | head -1)"
-    fi
-}
-
-# ── Ask / validate Relay parameters ──────────────────────────────────────────
-_ask_relay_params() {
-    # RELAY_ADDRESS
-    if [[ -z "${RELAY_ADDRESS:-}" ]]; then
-        if [[ "$NON_INTERACTIVE" == true ]]; then
-            # Auto-detect primary IP
-            RELAY_ADDRESS="$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+')"
-            log_info "Auto-detected RELAY_ADDRESS: ${RELAY_ADDRESS}"
-        else
-            local detected
-            detected="$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo '')"
-            while true; do
-                read -rp "  Enter RELAY (this server) IP [${detected}]: " RELAY_ADDRESS
-                RELAY_ADDRESS="${RELAY_ADDRESS:-$detected}"
-                _validate_ip "$RELAY_ADDRESS" && break
-                log_warn "Invalid IP: '${RELAY_ADDRESS}'"
-            done
-        fi
-    fi
-    _validate_ip "$RELAY_ADDRESS" || { log_error "Invalid RELAY_ADDRESS: ${RELAY_ADDRESS}"; exit 1; }
-
-    # RELAY_PORT
-    RELAY_PORT="${RELAY_PORT:-443}"
-    if [[ "$NON_INTERACTIVE" == false ]]; then
-        read -rp "  RELAY port [${RELAY_PORT}]: " _rp
-        RELAY_PORT="${_rp:-$RELAY_PORT}"
-    fi
-    _validate_port "$RELAY_PORT" || { log_error "Invalid RELAY_PORT: ${RELAY_PORT}"; exit 1; }
-
-    # GATE_ADDRESS
-    if [[ -z "${GATE_ADDRESS:-}" ]]; then
+    # Get gate address
+    if [[ -z "$GATE_ADDRESS" ]]; then
         if [[ "$NON_INTERACTIVE" == true ]]; then
             log_error "--gate-address is required in non-interactive Relay mode"
             exit 1
         fi
         while true; do
-            read -rp "  Enter GATE IP address: " GATE_ADDRESS
-            _validate_ip "$GATE_ADDRESS" && break
-            log_warn "Invalid IP: '${GATE_ADDRESS}'"
+            read -rp "  Enter GATE IP address (e.g. 1.2.3.4): " GATE_ADDRESS
+            if _validate_ip "$GATE_ADDRESS"; then
+                break
+            else
+                log_warn "Invalid IP: '${GATE_ADDRESS}'. Please try again."
+            fi
         done
+    else
+        if ! _validate_ip "$GATE_ADDRESS"; then
+            log_error "Invalid GATE_ADDRESS: '${GATE_ADDRESS}'"
+            exit 1
+        fi
     fi
-    _validate_ip "$GATE_ADDRESS" || { log_error "Invalid GATE_ADDRESS: ${GATE_ADDRESS}"; exit 1; }
 
-    # GATE_PORT
-    GATE_PORT="${GATE_PORT:-9443}"
-    if [[ "$NON_INTERACTIVE" == false ]]; then
-        read -rp "  GATE port [${GATE_PORT}] (recommended: NOT 443): " _gp
-        GATE_PORT="${_gp:-$GATE_PORT}"
-    fi
-    _validate_port "$GATE_PORT" || { log_error "Invalid GATE_PORT: ${GATE_PORT}"; exit 1; }
+    log_info "GATE_ADDRESS: ${GATE_ADDRESS}"
 
-    log_info "RELAY  : ${RELAY_ADDRESS}:${RELAY_PORT}"
-    log_info "GATE   : ${GATE_ADDRESS}:${GATE_PORT}"
-}
-
-# ── Write HAProxy config ──────────────────────────────────────────────────────
-_write_haproxy_cfg() {
     local haproxy_cfg="/etc/haproxy/haproxy.cfg"
     backup_file "$haproxy_cfg"
 
-    # Ensure list files exist (haproxy will fail if referenced files are missing)
-    touch /etc/haproxy/blocked.lst /etc/haproxy/allowed.lst
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would configure HAProxy → ${GATE_ADDRESS}:443 with send-proxy-v2"
+        STEP_STATUS["haproxy"]="DRY"
+        return 0
+    fi
 
     cat > "$haproxy_cfg" <<EOF
 global
     log /dev/log local0
     maxconn 50000
-    stats socket /var/run/haproxy/admin.sock mode 660 level admin
+    daemon
 
 defaults
     mode tcp
-    timeout connect 10s
-    timeout client  5m
-    timeout server  5m
+    timeout connect 5s
+    timeout client  50s
+    timeout server  50s
     log             global
     option          tcplog
 
-frontend ft_inbound
-    bind ${RELAY_ADDRESS}:${RELAY_PORT}
-    tcp-request inspect-delay 5s
-    tcp-request content accept if { req_ssl_hello_type 1 }
-    use_backend bk_blocked if { src -f /etc/haproxy/blocked.lst }
-    use_backend bk_ignored if !{ src -f /etc/haproxy/allowed.lst }
-    default_backend bk_upstream
+frontend ft_xray
+    bind *:443
+    default_backend bk_xray
 
-backend bk_blocked
-    server blackhole 127.0.0.1:1
-
-backend bk_ignored
-    server blackhole 127.0.0.1:1
-
-backend bk_upstream
-    option tcp-check
-    server upstream ${GATE_ADDRESS}:${GATE_PORT} send-proxy-v2 check inter 10s rise 2 fall 3
+backend bk_xray
+    server xray ${GATE_ADDRESS}:443 send-proxy-v2
 EOF
 
-    log_info "HAProxy config written"
-}
-
-# ── Blocklist update script ───────────────────────────────────────────────────
-_write_update_blocklist() {
-    cat > /usr/local/bin/update_blocklist.sh << 'SCRIPT'
-#!/bin/bash
-# Downloads government networks + antiscanner lists into /etc/haproxy/blocked.lst
-set -euo pipefail
-
-GL=$(echo "aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL3NoYWRvdy1uZXRsYWIvdHJhZmZpYy1ndWFyZC1saXN0cy9yZWZzL2hlYWRzL21haW4vcHVibGljL2dvdmVybm1lbnRfbmV0d29ya3MubGlzdA==" | base64 -d)
-AU=$(echo "aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL3NoYWRvdy1uZXRsYWIvdHJhZmZpYy1ndWFyZC1saXN0cy9yZWZzL2hlYWRzL21haW4vcHVibGljL2FudGlzY2FubmVyLmxpc3Q=" | base64 -d)
-OUTPUT="/etc/haproxy/blocked.lst"
-TMP="$(mktemp)"
-
-curl -fsSL "$GL" "$AU" \
-    | grep -v '^#' \
-    | grep -v '^$' \
-    | grep -v ':' \
-    | sort -u > "$TMP"
-
-mv "$TMP" "$OUTPUT"
-echo "$(date '+%Y-%m-%d %H:%M:%S')  blocked: $(wc -l < "$OUTPUT") networks written to $OUTPUT"
-SCRIPT
-
-    chmod +x /usr/local/bin/update_blocklist.sh
-    log_info "Created /usr/local/bin/update_blocklist.sh"
-}
-
-# ── Allowlist update script (URL fetch or RADB whois fallback) ───────────────
-_write_update_allowlist() {
-    if [[ -n "${ALLOWED_LST_URL:-}" ]]; then
-        # ── Mode A: fetch pre-built allowed.lst from URL (e.g. GitHub raw) ──
-        cat > /usr/local/bin/update_allowlist.sh << SCRIPT
-#!/bin/bash
-# Fetches /etc/haproxy/allowed.lst from a pre-built URL (GitHub Actions / raw)
-set -euo pipefail
-
-OUTPUT="/etc/haproxy/allowed.lst"
-TIMESTAMP_FILE="/etc/haproxy/allowed.lst.lastmod"
-TMP="\$(mktemp)"
-LOG="/var/log/haproxy-allowlist-update.log"
-URL="${ALLOWED_LST_URL}"
-
-_log() { echo "\$(date '+%Y-%m-%d %H:%M:%S')  \$*" | tee -a "\$LOG"; }
-
-_log "Fetching allowed.lst from \$URL"
-
-# Build curl args: use If-Modified-Since if we have a saved timestamp
-CURL_ARGS=(-fsSL --retry 3 --retry-delay 5 --max-time 30 --write-out "%{http_code}")
-if [[ -f "\$TIMESTAMP_FILE" ]]; then
-    CURL_ARGS+=(--header "If-Modified-Since: \$(cat "\$TIMESTAMP_FILE")")
-fi
-
-HTTP_CODE=\$(curl "\${CURL_ARGS[@]}" "\$URL" -o "\$TMP" 2>>\$LOG || true)
-
-case "\$HTTP_CODE" in
-    200)
-        # Sanity check: must contain at least one CIDR
-        if grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/' "\$TMP"; then
-            mv "\$TMP" "\$OUTPUT"
-            # Save Last-Modified for next run
-            curl -fsSI --max-time 10 "\$URL" 2>/dev/null \
-                | grep -i '^last-modified:' \
-                | sed 's/[Ll]ast-[Mm]odified: //' \
-                | tr -d '\r' > "\$TIMESTAMP_FILE" || true
-            _log "OK: \$(wc -l < "\$OUTPUT") networks written to \$OUTPUT"
-        else
-            _log "ERROR: downloaded file contains no valid CIDRs — keeping existing list"
-            rm -f "\$TMP"
-            exit 1
-        fi
-        ;;
-    304)
-        _log "NOT MODIFIED: list unchanged on server, skipping update"
-        rm -f "\$TMP"
-        exit 0
-        ;;
-    *)
-        _log "ERROR: HTTP \$HTTP_CODE from \$URL — keeping existing list"
-        rm -f "\$TMP"
-        exit 1
-        ;;
-esac
-SCRIPT
-        log_info "Created /usr/local/bin/update_allowlist.sh (URL mode: ${ALLOWED_LST_URL})"
-    else
-        # ── Mode B: generate locally via RADB whois (original behaviour) ──
-        cat > /usr/local/bin/update_allowlist.sh << 'SCRIPT'
-#!/bin/bash
-# Fetches IPv4 prefixes for Russian mobile/ISP ASNs from RADB whois
-# into /etc/haproxy/allowed.lst
-set -euo pipefail
-
-OUTPUT="/etc/haproxy/allowed.lst"
-TMP="$(mktemp)"
-
-# Russian operator ASNs (MTS, MegaFon, Beeline, Tele2, Rostelecom, etc.)
-ASNS="8359 13174 21365 30922 34351 3216 16043 16345 42842
-31133 8263 6854 50928 48615 47395 47218 43841 42891 41976
-35298 34552 31268 31224 31213 31208 31205 31195 31163 29648
-25290 25159 24866 20663 20632 12396 202804 12958 15378 42437
-48092 48190 41330 39374 13116 201776 206673 12389 35816 205638
-214257 202498 203451 203561 47204"
-
-> "$TMP"
-
-for ASN in $ASNS; do
-    echo -n "Fetching AS${ASN}... "
-    RESULT=$(whois -h whois.radb.net -- "-i origin AS${ASN}" 2>/dev/null \
-        | grep "^route:" \
-        | awk '{print $2}')
-    COUNT=$(echo "$RESULT" | grep -c '.' || true)
-    echo "${COUNT} prefixes"
-    echo "$RESULT" >> "$TMP"
-    sleep 0.3
-done
-
-# Filter: IPv4 only, deduplicate, sort
-grep -v ':' "$TMP" | grep -E '^[0-9]' | sort -u > "$OUTPUT"
-rm -f "$TMP"
-
-echo "$(date '+%Y-%m-%d %H:%M:%S')  allowed: $(wc -l < "$OUTPUT") networks written to $OUTPUT"
-SCRIPT
-        log_info "Created /usr/local/bin/update_allowlist.sh (whois/RADB mode)"
-    fi
-
-    chmod +x /usr/local/bin/update_allowlist.sh
-}
-
-# ── Log analysis script ───────────────────────────────────────────────────────
-_write_analyze_logs() {
-    cat > /usr/local/bin/analyze_logs.sh << 'SCRIPT'
-#!/bin/bash
-# Extracts top IPs from haproxy blocked/ignored logs
-
-BLOCKED_LOG="/var/log/haproxy-blocked.log"
-IGNORED_LOG="/var/log/haproxy-ignored.log"
-BLOCKED_OUT="/etc/haproxy/blocked.txt"
-IGNORED_OUT="/etc/haproxy/ignored.txt"
-
-_analyze() {
-    local logfile="$1" outfile="$2"
-    if [[ ! -f "$logfile" ]]; then
-        echo "Log not found: $logfile"
-        return
-    fi
-    grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$logfile" \
-        | sort | uniq -c | sort -rn \
-        | awk '{printf "%s (%d)\n", $2, $1}' > "$outfile"
-    echo "$(date '+%Y-%m-%d %H:%M:%S')  $(wc -l < "$outfile") unique IPs → $outfile"
-}
-
-_analyze "$BLOCKED_LOG" "$BLOCKED_OUT"
-_analyze "$IGNORED_LOG" "$IGNORED_OUT"
-SCRIPT
-
-    chmod +x /usr/local/bin/analyze_logs.sh
-    log_info "Created /usr/local/bin/analyze_logs.sh"
-}
-
-# ── rsyslog: separate log files per backend ───────────────────────────────────
-_write_rsyslog_conf() {
-    install_packages rsyslog
-
-    # Ensure haproxy log dir exists for rsyslog socket
-    mkdir -p /var/lib/haproxy/dev
-
-    cat > /etc/rsyslog.d/49-haproxy.conf << 'EOF'
-$AddUnixListenSocket /var/lib/haproxy/dev/log
-
-if $programname == 'haproxy' and $msg contains 'bk_blocked' then /var/log/haproxy-blocked.log
-if $programname == 'haproxy' and $msg contains 'bk_ignored' then /var/log/haproxy-ignored.log
-
-:programname, startswith, "haproxy" /var/log/haproxy.log
-:programname, startswith, "haproxy" stop
-EOF
-
-    systemctl restart rsyslog
-    log_info "rsyslog configured for haproxy split logging"
-}
-
-# ── logrotate: hourly, keep 24h ───────────────────────────────────────────────
-_write_logrotate() {
-    cat > /etc/logrotate.d/haproxy << 'EOF'
-/var/log/haproxy*.log {
-    hourly
-    rotate 24
-    missingok
-    notifempty
-    compress
-    delaycompress
-    postrotate
-        [ ! -x /usr/lib/rsyslog/rsyslog-rotate ] || /usr/lib/rsyslog/rsyslog-rotate
-    endscript
-}
-EOF
-    log_info "logrotate configured (hourly, 24 rotations)"
-}
-
-# ── Cron: daily update lists → reload ────────────────────────────────────────
-#
-#   04:15  blocklist + log analysis  (fast, ~10s)
-#   04:20  allowlist                 (whois: slow ~2-3 min; URL: fast ~2s)
-#   04:25  haproxy reload            (after both lists are ready)
-#
-#   If ALLOWED_LST_URL is set, allowlist is also refreshed every 6 hours
-#   so the server stays in sync with GitHub Actions schedule (daily push).
-# ─────────────────────────────────────────────────────────────────────────────
-_write_cron() {
-    if [[ -n "${ALLOWED_LST_URL:-}" ]]; then
-        cat > /etc/cron.d/haproxy-lists << EOF
-# server-bootstrap: update haproxy IP lists (URL mode)
-# 04:15 — blocklist + log analysis (fast)
-15 4 * * * root /usr/local/bin/update_blocklist.sh && /usr/local/bin/analyze_logs.sh
-
-# 04:20 — allowlist from URL + reload
-20 4 * * * root /usr/local/bin/update_allowlist.sh && systemctl reload haproxy
-
-# Every 6h (skip 04:xx — covered above) — keep allowlist fresh
-# Runs at 10:00, 16:00, 22:00 — reload only if update succeeded (exit 0)
-0 10,16,22 * * * root /usr/local/bin/update_allowlist.sh && systemctl reload haproxy
-EOF
-        log_info "Cron jobs set: daily 04:15/04:20 + 10:00/16:00/22:00 allowlist refresh (URL mode)"
-    else
-        cat > /etc/cron.d/haproxy-lists << 'EOF'
-# server-bootstrap: update haproxy IP lists (whois/RADB mode)
-# 04:15 — blocklist + log analysis (fast)
-15 4 * * * root /usr/local/bin/update_blocklist.sh && /usr/local/bin/analyze_logs.sh
-
-# 04:20 — allowlist via whois (slow: ~2-3 min) + reload
-20 4 * * * root /usr/local/bin/update_allowlist.sh && systemctl reload haproxy
-EOF
-        log_info "Cron jobs set: daily 04:15/04:20 → update lists + reload haproxy (whois mode)"
-    fi
-}
-
-# ── Main HAProxy setup entry point ────────────────────────────────────────────
-setup_haproxy() {
-    log_step "Configuring HAProxy 2.8 (Relay/router mode)"
-
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would install HAProxy 2.8 (distro-first, PPA fallback)"
-        log_dry "Would configure: RELAY:${RELAY_ADDRESS:-?}:${RELAY_PORT:-443} → GATE:${GATE_ADDRESS:-?}:${GATE_PORT:-9443}"
-        log_dry "Would create: update_blocklist.sh, update_allowlist.sh, analyze_logs.sh"
-        if [[ -n "${ALLOWED_LST_URL:-}" ]]; then
-            log_dry "Allowlist mode: URL fetch → ${ALLOWED_LST_URL}"
-            log_dry "Would configure: rsyslog split logs, logrotate (hourly/24h), cron (04:15/04:20 + 10:00/16:00/22:00)"
-        else
-            log_dry "Allowlist mode: whois/RADB (slow, ~2-3 min)"
-            log_dry "Would configure: rsyslog split logs, logrotate (hourly/24h), cron (04:15/04:20)"
-        fi
-        STEP_STATUS["haproxy"]="DRY"
-        return 0
-    fi
-
-    # 1. Collect parameters
-    _ask_relay_params
-
-    # 2. Install HAProxy 2.8
-    _install_haproxy_28
-
-    # 3. Write helper scripts
-    _write_update_blocklist
-    _write_update_allowlist
-    _write_analyze_logs
-
-    # 4. Write HAProxy config
-    _write_haproxy_cfg
-
-    # 5. Fetch initial lists
-    log_info "Fetching initial blocklist..."
-    /usr/local/bin/update_blocklist.sh || log_warn "Blocklist fetch failed — continuing with empty list"
-
-    local allowlist_label="(may take 2-3 min via whois)"
-    [[ -n "${ALLOWED_LST_URL:-}" ]] && allowlist_label="from URL"
-    log_info "Fetching initial allowlist ${allowlist_label}..."
-    /usr/local/bin/update_allowlist.sh || log_warn "Allowlist fetch failed — continuing with empty list"
-
-    # 6. Logging infrastructure
-    _write_rsyslog_conf
-    _write_logrotate
-    _write_cron
-
-    # 7. Validate config then restart
-    log_info "Validating HAProxy config..."
-    if haproxy -c -f /etc/haproxy/haproxy.cfg; then
-        systemctl enable haproxy &>/dev/null
-        systemctl restart haproxy
-        log_ok "HAProxy 2.8 started (${RELAY_ADDRESS}:${RELAY_PORT} → ${GATE_ADDRESS}:${GATE_PORT})"
-        systemctl status haproxy --no-pager -l 2>/dev/null | head -10 | sed 's/^/    /'
+    # Validate config before restart
+    if haproxy -c -f "$haproxy_cfg" &>/dev/null; then
+        systemctl enable haproxy  &>/dev/null
+        systemctl restart haproxy &>/dev/null
+        log_ok "HAProxy configured and started (→ ${GATE_ADDRESS}:443)"
         STEP_STATUS["haproxy"]="OK"
     else
         log_error "HAProxy config validation FAILED — reverting backup"
-        local bak="${BACKUP_DIR}/haproxy.cfg.${TIMESTAMP}.bak"
-        [[ -f "$bak" ]] && cp -a "$bak" /etc/haproxy/haproxy.cfg
+        if [[ -f "${BACKUP_DIR}/haproxy.cfg.${TIMESTAMP}.bak" ]]; then
+            cp -a "${BACKUP_DIR}/haproxy.cfg.${TIMESTAMP}.bak" "$haproxy_cfg"
+        fi
         STEP_STATUS["haproxy"]="FAILED"
         return 1
     fi
-
-    # 8. Show useful hints
-    echo ""
-    log_info "Useful commands:"
-    echo -e "    ${CYAN}# Live HAProxy log${RESET}"
-    echo    "    tail -f /var/log/haproxy.log"
-    echo -e "    ${CYAN}# Blocked IPs log${RESET}"
-    echo    "    tail -f /var/log/haproxy-blocked.log"
-    echo -e "    ${CYAN}# Ignored IPs log${RESET}"
-    echo    "    tail -f /var/log/haproxy-ignored.log"
-    echo -e "    ${CYAN}# Stats via socket${RESET}"
-    echo    "    echo 'show info' | socat stdio /var/run/haproxy/admin.sock"
-    echo -e "    ${CYAN}# Force update lists now${RESET}"
-    echo    "    /usr/local/bin/update_blocklist.sh && /usr/local/bin/update_allowlist.sh && systemctl reload haproxy"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1490,388 +1025,68 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 17b · STATE ENGINE (resume + version-aware reinstall)
+# SECTION 18 · MODE FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
-#
-#  State file format (/etc/server-bootstrap.state):
-#    VERSION=1.0.2
-#    MODE=relay
-#    UPDATED=2026-04-12T04:00:00Z
-#    step:haproxy=OK
-#    step:ufw=OK
-#    step:fail2ban=FAILED
-#    ...
-#
-#  Logic:
-#    - state_step_ok <step>  → returns 0 if step=OK and version matches
-#    - state_save_step <step> <status>  → writes/updates step in state file
-#    - state_check_version  → returns 0 if version matches, 1 if changed
-#    - state_load  → reads state file into STATE_ associative array
-#    - state_reset → clears state file (full reinstall)
-# ─────────────────────────────────────────────────────────────────────────────
-
-declare -A _STATE=()
-_STATE_VERSION=""
-_STATE_MODE=""
-
-state_load() {
-    [[ -f "$STATE_FILE" ]] || return 0
-    while IFS='=' read -r key val; do
-        [[ "$key" =~ ^# ]] && continue
-        [[ -z "$key" ]]    && continue
-        case "$key" in
-            VERSION) _STATE_VERSION="$val" ;;
-            MODE)    _STATE_MODE="$val"    ;;
-            step:*)  _STATE["${key#step:}"]="$val" ;;
-        esac
-    done < "$STATE_FILE"
-    log_debug "State loaded: version=${_STATE_VERSION} mode=${_STATE_MODE} steps=${#_STATE[@]}"
-}
-
-state_save_step() {
-    local step="$1" status="$2"
-    [[ "$DRY_RUN" == true ]] && return 0
-
-    # Update in-memory
-    _STATE["$step"]="$status"
-
-    # Rewrite state file atomically
-    local tmp; tmp="$(mktemp)"
-    {
-        echo "VERSION=${SCRIPT_VERSION}"
-        echo "MODE=${MODE:-${_STATE_MODE}}"
-        echo "UPDATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        for s in "${!_STATE[@]}"; do
-            echo "step:${s}=${_STATE[$s]}"
-        done
-    } > "$tmp"
-    mv "$tmp" "$STATE_FILE"
-}
-
-state_step_ok() {
-    # Returns 0 (true) if step completed OK in current version → skip it
-    local step="$1"
-    [[ "$RESUME" != true ]]                        && return 1
-    [[ "${_STATE[$step]:-}" == "OK" ]]             || return 1
-    [[ "${_STATE_VERSION:-}" == "$SCRIPT_VERSION" ]] || return 1
-    return 0
-}
-
-state_check_version() {
-    # Returns 0 if state exists and version differs from current
-    [[ -f "$STATE_FILE" ]] || return 1
-    [[ -n "${_STATE_VERSION:-}" ]] || return 1
-    [[ "${_STATE_VERSION}" != "$SCRIPT_VERSION" ]] && return 0
-    return 1
-}
-
-state_reset() {
-    rm -f "$STATE_FILE"
-    _STATE=()
-    _STATE_VERSION=""
-    _STATE_MODE=""
-    log_info "State cleared — fresh install"
-}
-
-# Wrapper: run a step with automatic state tracking
-# Usage: run_step <step_name> <function_name> [args...]
-run_step() {
-    local step="$1"; shift
-    local fn="$1";   shift
-
-    if state_step_ok "$step"; then
-        log_ok "  [RESUME] Skipping ${step} — already completed in v${_STATE_VERSION}"
-        STEP_STATUS["$step"]="SKIPPED(resume)"
-        return 0
-    fi
-
-    "$fn" "$@"
-    local rc=$?
-
-    if [[ $rc -eq 0 ]]; then
-        state_save_step "$step" "OK"
-    else
-        state_save_step "$step" "FAILED"
-    fi
-    return $rc
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 17c · UNINSTALL FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────────────
-
-uninstall_haproxy() {
-    log_step "Uninstalling HAProxy"
-    [[ "$DRY_RUN" == true ]] && { log_dry "Would remove haproxy, cron, scripts, lists"; return 0; }
-
-    systemctl stop haproxy    2>/dev/null || true
-    systemctl disable haproxy 2>/dev/null || true
-    apt-get remove --purge -y haproxy 2>/dev/null || true
-    apt-get autoremove -y 2>/dev/null || true
-
-    rm -f /etc/cron.d/haproxy-lists
-    rm -f /usr/local/bin/update_blocklist.sh
-    rm -f /usr/local/bin/update_allowlist.sh
-    rm -f /usr/local/bin/analyze_logs.sh
-    rm -f /etc/rsyslog.d/49-haproxy.conf
-    rm -f /etc/logrotate.d/haproxy
-    rm -rf /etc/haproxy
-    systemctl restart rsyslog 2>/dev/null || true
-
-    state_save_step "haproxy" "REMOVED"
-    log_ok "HAProxy removed"
-}
-
-uninstall_fail2ban() {
-    log_step "Uninstalling fail2ban"
-    [[ "$DRY_RUN" == true ]] && { log_dry "Would remove fail2ban and jail configs"; return 0; }
-
-    systemctl stop fail2ban    2>/dev/null || true
-    systemctl disable fail2ban 2>/dev/null || true
-    apt-get remove --purge -y fail2ban 2>/dev/null || true
-    rm -f /etc/fail2ban/jail.local
-
-    state_save_step "fail2ban" "REMOVED"
-    log_ok "fail2ban removed"
-}
-
-uninstall_ufw() {
-    log_step "Uninstalling UFW"
-    [[ "$DRY_RUN" == true ]] && { log_dry "Would disable and purge ufw"; return 0; }
-
-    ufw --force disable 2>/dev/null || true
-    apt-get remove --purge -y ufw 2>/dev/null || true
-
-    state_save_step "ufw" "REMOVED"
-    log_ok "UFW removed"
-}
-
-uninstall_remnanode() {
-    log_step "Uninstalling remnanode"
-    [[ "$DRY_RUN" == true ]] && { log_dry "Would stop and remove remnanode container and data"; return 0; }
-
-    local compose_dir="/opt/remnanode"
-    if [[ -f "${compose_dir}/docker-compose.yml" ]]; then
-        docker compose -f "${compose_dir}/docker-compose.yml" down --volumes 2>/dev/null || true
-    fi
-    rm -rf "$compose_dir"
-    rm -rf /var/lib/remnanode
-    rm -rf /var/log/remnanode
-
-    state_save_step "remnanode" "REMOVED"
-    log_ok "remnanode removed"
-}
-
-uninstall_selfsteal() {
-    log_step "Uninstalling selfsteal"
-    [[ "$DRY_RUN" == true ]] && { log_dry "Would remove selfsteal service and files"; return 0; }
-
-    systemctl stop selfsteal    2>/dev/null || true
-    systemctl disable selfsteal 2>/dev/null || true
-    rm -f /etc/systemd/system/selfsteal.service
-    rm -f /usr/local/bin/selfsteal
-    rm -rf /etc/selfsteal
-    systemctl daemon-reload 2>/dev/null || true
-
-    state_save_step "selfsteal" "REMOVED"
-    log_ok "selfsteal removed"
-}
-
-uninstall_mobile443() {
-    log_step "Uninstalling mobile443-filter"
-    [[ "$DRY_RUN" == true ]] && { log_dry "Would remove mobile443 nftables rules and scripts"; return 0; }
-
-    # Try to call cleanup if script exists
-    if [[ -f /usr/local/bin/mobile443-filter.sh ]]; then
-        bash /usr/local/bin/mobile443-filter.sh uninstall 2>/dev/null || true
-    fi
-    rm -f /usr/local/bin/mobile443-filter.sh
-    rm -f /etc/cron.d/mobile443-filter
-    rm -f /etc/nftables.d/mobile443.nft 2>/dev/null || true
-
-    state_save_step "mobile443" "REMOVED"
-    log_ok "mobile443-filter removed"
-}
-
-uninstall_docker() {
-    log_step "Uninstalling Docker"
-    [[ "$DRY_RUN" == true ]] && { log_dry "Would remove docker, images, volumes"; return 0; }
-
-    systemctl stop docker 2>/dev/null || true
-    apt-get remove --purge -y docker-ce docker-ce-cli containerd.io \
-        docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
-    apt-get autoremove -y 2>/dev/null || true
-    rm -rf /var/lib/docker /etc/docker
-
-    state_save_step "docker" "REMOVED"
-    log_ok "Docker removed"
-}
-
-uninstall_sysctl() {
-    log_step "Reverting sysctl settings"
-    [[ "$DRY_RUN" == true ]] && { log_dry "Would remove ${SYSCTL_FILE} and reload sysctl"; return 0; }
-
-    rm -f "$SYSCTL_FILE"
-    sysctl --system &>/dev/null || true
-
-    state_save_step "sysctl_network" "REMOVED"
-    state_save_step "sysctl_router"  "REMOVED"
-    log_ok "sysctl settings reverted"
-}
-
-# Interactive uninstall menu
-run_uninstall() {
-    log_step "UNINSTALL MODE"
-
-    # Load state to show what's installed
-    state_load
-
-    echo ""
-    echo -e "  ${BOLD}${RED}Uninstall — select components to remove:${RESET}"
-    echo ""
-
-    # Build list of installed components from state
-    local components=()
-    local labels=()
-
-    for step in haproxy fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network; do
-        local st="${_STATE[$step]:-unknown}"
-        if [[ "$st" == "OK" || "$st" == "SKIPPED(resume)" ]]; then
-            components+=("$step")
-            labels+=("${step}  [installed]")
-        elif [[ "$st" == "REMOVED" ]]; then
-            : # skip already removed
-        else
-            components+=("$step")
-            labels+=("${step}  [status: ${st}]")
-        fi
-    done
-
-    if [[ ${#components[@]} -eq 0 ]]; then
-        log_warn "No installed components found in state file"
-        log_info "You can still uninstall manually by selecting components below"
-        components=(haproxy fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network)
-        for c in "${components[@]}"; do labels+=("$c"); done
-    fi
-
-    echo -e "  ${YELLOW}0)${RESET} ALL components (full wipe)"
-    local i=1
-    for label in "${labels[@]}"; do
-        echo -e "  ${YELLOW}${i})${RESET} ${label}"
-        ((i++))
-    done
-    echo -e "  ${RED}q)${RESET} Cancel"
-    echo ""
-
-    local choice
-    if [[ "$NON_INTERACTIVE" == true ]]; then
-        log_error "--uninstall requires interactive mode or explicit --mode with component flags"
-        exit 1
-    fi
-
-    read -rp "  Your choice: " choice
-
-    case "$choice" in
-        q|Q) log_info "Uninstall cancelled"; return 0 ;;
-        0)
-            log_warn "Full wipe selected — removing ALL components"
-            read -rp "  Are you sure? This cannot be undone. [yes/N]: " confirm
-            [[ "${confirm,,}" != "yes" ]] && { log_info "Cancelled"; return 0; }
-            uninstall_haproxy
-            uninstall_remnanode
-            uninstall_selfsteal
-            uninstall_mobile443
-            uninstall_fail2ban
-            uninstall_ufw
-            uninstall_sysctl
-            rm -f "$STATE_FILE" "$CONFIG_FILE"
-            log_ok "Full uninstall complete"
-            ;;
-        *)
-            local idx=$(( choice - 1 ))
-            if [[ $idx -ge 0 && $idx -lt ${#components[@]} ]]; then
-                local target="${components[$idx]}"
-                log_info "Uninstalling: ${target}"
-                case "$target" in
-                    haproxy)       uninstall_haproxy    ;;
-                    fail2ban)      uninstall_fail2ban   ;;
-                    ufw)           uninstall_ufw        ;;
-                    remnanode)     uninstall_remnanode  ;;
-                    selfsteal)     uninstall_selfsteal  ;;
-                    mobile443)     uninstall_mobile443  ;;
-                    docker)        uninstall_docker     ;;
-                    sysctl_network|sysctl_router) uninstall_sysctl ;;
-                    *) log_error "Unknown component: ${target}" ;;
-                esac
-            else
-                log_warn "Invalid choice: ${choice}"
-            fi
-            ;;
-    esac
-}
-
-
 
 run_base() {
     log_step "MODE: BASE"
     apt_update
-    run_step "base_packages"   setup_base_packages
-    run_step "timezone"        setup_timezone
-    run_step "ssh"             setup_ssh
-    run_step "sysctl_network"  apply_sysctl_network
-    run_step "swap"            setup_swap
-    run_step "ufw"             setup_ufw "base"
-    run_step "fail2ban"        setup_fail2ban
+    setup_base_packages
+    setup_timezone
+    setup_ssh
+    apply_sysctl_network
+    setup_swap
+    setup_ufw "base"
+    setup_fail2ban
     STEP_STATUS["mode"]="base/OK"
 }
 
 run_node() {
     log_step "MODE: NODE"
     apt_update
-    run_step "base_packages"   setup_base_packages
-    run_step "timezone"        setup_timezone
-    run_step "ssh"             setup_ssh
-    run_step "sysctl_network"  apply_sysctl_network
-    run_step "swap"            setup_swap
-    run_step "ufw"             setup_ufw "node"
-    run_step "fail2ban"        setup_fail2ban
-    run_step "mobile443"       install_mobile443_filter "node"
-    run_step "remnanode"       install_remnanode
-    run_step "selfsteal"       install_selfsteal
+    setup_base_packages
+    setup_timezone
+    setup_ssh
+    apply_sysctl_network
+    setup_swap
+    setup_ufw "node"
+    setup_fail2ban
+    install_mobile443_filter "node"
+    install_remnanode
+    install_selfsteal
     STEP_STATUS["mode"]="node/OK"
 }
 
 run_gate() {
     log_step "MODE: GATE"
     apt_update
-    run_step "base_packages"   setup_base_packages
-    run_step "timezone"        setup_timezone
-    run_step "ssh"             setup_ssh
-    run_step "sysctl_network"  apply_sysctl_network
-    run_step "swap"            setup_swap
-    run_step "ufw"             setup_ufw "gate"
-    run_step "fail2ban"        setup_fail2ban
-    run_step "mobile443"       install_mobile443_filter "gate"
-    run_step "remnanode"       install_remnanode
-    run_step "selfsteal"       install_selfsteal
+    setup_base_packages
+    setup_timezone
+    setup_ssh
+    apply_sysctl_network
+    setup_swap
+    setup_ufw "gate"
+    setup_fail2ban
+    install_mobile443_filter "gate"
+    install_remnanode
+    install_selfsteal
     STEP_STATUS["mode"]="gate/OK"
 }
 
 run_relay() {
     log_step "MODE: Relay (NODE RELAY)"
-    # Relay mode: HAProxy handles traffic filtering via blocked.lst + allowed.lst.
-    # mobile443-filter is NOT used here — allowlist logic replaces it.
-    # remnanode and selfsteal are NOT installed on a relay/router node.
     apt_update
-    run_step "base_packages"   setup_base_packages
-    run_step "timezone"        setup_timezone
-    run_step "ssh"             setup_ssh
-    run_step "sysctl_network"  apply_sysctl_network
-    run_step "sysctl_router"   apply_sysctl_router
-    run_step "swap"            setup_swap
-    run_step "ufw"             setup_ufw "relay"
-    run_step "fail2ban"        setup_fail2ban
-    run_step "haproxy"         setup_haproxy
+    setup_base_packages
+    setup_timezone
+    setup_ssh
+    apply_sysctl_network
+    apply_sysctl_router
+    setup_swap
+    setup_ufw "relay"
+    setup_fail2ban
+    setup_haproxy
+    install_mobile443_filter "relay"
+    # No remnanode, no selfsteal by default
     STEP_STATUS["mode"]="relay/OK"
 }
 
@@ -1908,20 +1123,9 @@ run_custom() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 show_menu() {
-    # Load state once for the menu session
-    state_load
-
     while true; do
         clear
         print_header
-
-        # Show resume hint if previous install exists
-        if [[ -n "${_STATE_MODE:-}" ]]; then
-            echo -e "  ${YELLOW}⚡ Previous install found: mode=${_STATE_MODE} v${_STATE_VERSION}${RESET}"
-            echo -e "  ${GRAY}   Use 'r) Resume' to continue from where it stopped${RESET}"
-            echo ""
-        fi
-
         echo -e "  ${BOLD}Select mode:${RESET}"
         echo ""
         echo -e "  ${CYAN}1)${RESET} base    — Base server preparation only"
@@ -1930,11 +1134,9 @@ show_menu() {
         echo -e "  ${CYAN}4)${RESET} relay   — Relay/Node Relay mode (base + haproxy + mobile443 filter)"
         echo -e "  ${CYAN}5)${RESET} custom  — Step-by-step component selection"
         echo ""
-        echo -e "  ${YELLOW}r)${RESET} Resume  — Continue interrupted installation"
         echo -e "  ${YELLOW}s)${RESET} Status  — Show current system status"
         echo -e "  ${YELLOW}d)${RESET} Dry run — Toggle dry-run (currently: ${DRY_RUN})"
         echo -e "  ${YELLOW}v)${RESET} Verbose — Toggle verbose (currently: ${VERBOSE})"
-        echo -e "  ${RED}u)${RESET} Uninstall — Remove installed components"
         echo -e "  ${RED}q)${RESET} Quit"
         echo ""
         print_separator
@@ -1946,23 +1148,6 @@ show_menu() {
             3) MODE="gate";   show_summary_confirm && run_gate   ;;
             4) MODE="relay";  show_summary_confirm && run_relay  ;;
             5) MODE="custom"; run_custom ;;
-            r|R)
-                if [[ -z "${_STATE_MODE:-}" ]]; then
-                    log_warn "No previous installation state found"
-                else
-                    RESUME=true
-                    MODE="${_STATE_MODE}"
-                    log_info "Resuming ${MODE} (v${_STATE_VERSION} → v${SCRIPT_VERSION})"
-                    show_summary_confirm && case "$MODE" in
-                        base)  run_base  ;;
-                        node)  run_node  ;;
-                        gate)  run_gate  ;;
-                        relay) run_relay ;;
-                        *)     log_error "Cannot resume unknown mode: ${MODE}" ;;
-                    esac
-                fi
-                ;;
-            u|U) run_uninstall; read -rp "  Press Enter to continue..." _ ;;
             s|S) check_status_all; read -rp "  Press Enter to continue..." _ ;;
             d|D) DRY_RUN=$([ "$DRY_RUN" == true ] && echo false || echo true); log_info "Dry-run: ${DRY_RUN}" ;;
             v|V) VERBOSE=$([ "$VERBOSE" == true ] && echo false || echo true); log_info "Verbose: ${VERBOSE}" ;;
@@ -1970,14 +1155,12 @@ show_menu() {
             *)   log_warn "Unknown option: ${choice}" ;;
         esac
 
-        if [[ -n "$MODE" && "$MODE" != "custom" && "$RESUME" != true ]]; then
+        if [[ -n "$MODE" && "$MODE" != "custom" ]]; then
             save_config
             print_summary
             check_status_all
             break
         fi
-        # Reset RESUME flag after one cycle so menu stays usable
-        RESUME=false
     done
 }
 
@@ -2007,9 +1190,6 @@ ${BOLD}Usage:${RESET}
 ${BOLD}Options:${RESET}
   --mode <mode>          Run mode: base | node | gate | relay | custom
   --gate-address <ip>    Gate IP address (required for relay mode)
-  --allowed-url <url>    URL to fetch allowed.lst (raw GitHub/CDN); empty = use whois/RADB
-  --resume               Resume interrupted install (skip already-OK steps)
-  --uninstall            Interactive uninstall menu
   --dry-run              Simulate — no changes applied
   --verbose, -v          Enable verbose/debug output
   --skip-selfsteal       Skip selfsteal installation
@@ -2029,9 +1209,6 @@ ${BOLD}Examples:${RESET}
   # Relay/Node Relay mode with gate address
   bash ${SCRIPT_NAME} --mode relay --gate-address 1.2.3.4 --non-interactive
 
-  # Relay mode with pre-built allowlist from GitHub
-  bash ${SCRIPT_NAME} --mode relay --gate-address 1.2.3.4 --allowed-url https://raw.githubusercontent.com/USER/REPO/main/allowed.lst --non-interactive
-
   # Dry run (preview only)
   bash ${SCRIPT_NAME} --mode node --dry-run --verbose
 
@@ -2045,13 +1222,8 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --mode)            MODE="$2";          shift 2 ;;
-            --gate-address)    GATE_ADDRESS="$2";    shift 2 ;;
-            --allowed-url)     ALLOWED_LST_URL="$2"; shift 2 ;;
-            --relay-address)   RELAY_ADDRESS="$2"; shift 2 ;;
-            --relay-port)      RELAY_PORT="$2";    shift 2 ;;
-            --gate-port)       GATE_PORT="$2";     shift 2 ;;
-            --resume)          RESUME=true;          shift   ;;
-            --uninstall)       UNINSTALL=true;        shift   ;;
+            --gate-address)    GATE_ADDRESS="$2";  shift 2 ;;
+            --dry-run)         DRY_RUN=true;        shift   ;;
             --verbose|-v)      VERBOSE=true;         shift   ;;
             --skip-selfsteal)  SKIP_SELFSTEAL=true;  shift   ;;
             --skip-update)     SKIP_UPDATE=true;     shift   ;;
@@ -2094,71 +1266,14 @@ main() {
         log_warn "DRY-RUN mode active — no changes will be made"
     fi
 
-    # ── Uninstall mode ────────────────────────────────────────────────────────
-    if [[ "$UNINSTALL" == true ]]; then
-        state_load
-        run_uninstall
-        exit 0
-    fi
-
-    # ── Load existing state ───────────────────────────────────────────────────
-    state_load
-
-    # ── Version mismatch handling ─────────────────────────────────────────────
-    if state_check_version; then
-        echo ""
-        log_warn "Installed version: ${_STATE_VERSION}  →  Current script: ${SCRIPT_VERSION}"
-        echo -e "  ${YELLOW}A previous installation was found with a different version.${RESET}"
-        echo ""
-        if [[ "$NON_INTERACTIVE" == false ]]; then
-            echo -e "  ${BOLD}What would you like to do?${RESET}"
-            echo -e "  ${YELLOW}1)${RESET} Resume from where it stopped (same steps, new version)"
-            echo -e "  ${YELLOW}2)${RESET} Full reinstall (clear state, start fresh)"
-            echo -e "  ${YELLOW}3)${RESET} Abort"
-            echo ""
-            read -rp "  Your choice [1/2/3]: " _vchoice
-            case "${_vchoice}" in
-                1)
-                    log_info "Resuming with version upgrade — OK steps will be re-run for new version"
-                    # Clear state so all steps re-run, but we keep MODE
-                    local _prev_mode="${_STATE_MODE}"
-                    state_reset
-                    [[ -n "${_prev_mode}" && -z "$MODE" ]] && MODE="$_prev_mode"
-                    RESUME=false  # force full re-run for version upgrade
-                    ;;
-                2)
-                    state_reset
-                    RESUME=false
-                    ;;
-                *)
-                    log_info "Aborted"
-                    exit 0
-                    ;;
-            esac
-        else
-            # Non-interactive: --resume flag decides
-            if [[ "$RESUME" == true ]]; then
-                log_info "Version changed — clearing state for clean reinstall (--resume ignores version mismatch)"
-                state_reset
-            else
-                log_warn "Version mismatch detected. Use --resume to reinstall or --uninstall to remove"
-                exit 1
-            fi
-        fi
-    elif [[ "$RESUME" == true && -n "${_STATE_MODE}" ]]; then
-        # Same version, resume mode — restore MODE from state if not set
-        [[ -z "$MODE" ]] && MODE="${_STATE_MODE}"
-        log_info "Resuming installation (v${SCRIPT_VERSION}, mode: ${MODE})"
-    fi
-
-    # ── Non-interactive with --mode ───────────────────────────────────────────
+    # Non-interactive with --mode
     if [[ "$NON_INTERACTIVE" == true && -n "$MODE" ]]; then
         case "$MODE" in
-            base)   run_base    ;;
-            node)   run_node    ;;
-            gate)   run_gate    ;;
-            relay)  run_relay   ;;
-            custom) run_custom  ;;
+            base)   run_base   ;;
+            node)   run_node   ;;
+            gate)   run_gate   ;;
+            relay)  run_relay  ;;
+            custom) run_custom ;;
             *)
                 log_error "Unknown mode: '${MODE}'. Valid: base | node | gate | relay | custom"
                 exit 1
@@ -2170,13 +1285,13 @@ main() {
         exit 0
     fi
 
-    # ── Interactive with --mode ───────────────────────────────────────────────
+    # Interactive with --mode (ask for confirm)
     if [[ -n "$MODE" ]]; then
         case "$MODE" in
-            base)   show_summary_confirm && run_base    ;;
-            node)   show_summary_confirm && run_node    ;;
-            gate)   show_summary_confirm && run_gate    ;;
-            relay)  show_summary_confirm && run_relay   ;;
+            base)   show_summary_confirm && run_base   ;;
+            node)   show_summary_confirm && run_node   ;;
+            gate)   show_summary_confirm && run_gate   ;;
+            relay)  show_summary_confirm && run_relay  ;;
             custom) run_custom ;;
             *)
                 log_error "Unknown mode: '${MODE}'"
@@ -2189,7 +1304,7 @@ main() {
         exit 0
     fi
 
-    # ── Full interactive menu ─────────────────────────────────────────────────
+    # Full interactive menu
     show_menu
 }
 
@@ -2210,7 +1325,7 @@ main "$@"
 #   sudo bash server-bootstrap.sh --mode base --non-interactive
 #   sudo bash server-bootstrap.sh --mode node --non-interactive
 #   sudo bash server-bootstrap.sh --mode gate --non-interactive --skip-selfsteal
-#   sudo bash server-bootstrap.sh --mode bs   --gate-address 1.2.3.4 --non-interactive
+#   sudo bash server-bootstrap.sh --mode relay --gate-address 1.2.3.4 --non-interactive
 #
 # ── Dev/testing ───────────────────────────────────────────────────────────────
 #   sudo bash server-bootstrap.sh --mode node --dry-run --verbose
@@ -2222,7 +1337,8 @@ main "$@"
 #
 # 1.  [ ] nftables / iptables-legacy switcher
 # 2.  [ ] Certificate management (acme.sh / certbot)
-# 3.  [x] Uninstall/rollback functions per component — DONE in v1.0.2
+# 3.  [ ] Uninstall/rollback functions per component
+#           (haproxy remove, fail2ban purge, etc.)
 # 4.  [ ] Provider presets (Hetzner, Vultr, DigitalOcean network quirks)
 # 5.  [ ] IPv6 dual-stack support in UFW rules
 # 6.  [ ] Automatic SSH key injection (from GitHub/URL)
