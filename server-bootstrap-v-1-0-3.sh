@@ -583,11 +583,26 @@ apply_sysctl_router() {
 # SECTION 9 · UFW
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Detect current SSH port (with fallback)
+# Detect current SSH port — checks sshd_config, running process, and active socket
 _get_ssh_port() {
     local sshd_cfg="/etc/ssh/sshd_config"
-    local port
+    local port=""
+
+    # 1. sshd_config: uncommented Port directive
     port="$(grep -E '^Port ' "$sshd_cfg" 2>/dev/null | awk '{print $2}' | head -1)"
+
+    # 2. Fallback: what port is sshd actually listening on right now
+    if [[ -z "$port" ]]; then
+        port="$(ss -tlnp 2>/dev/null | grep sshd | grep -oP '(?<=:)\d+' | head -1)"
+    fi
+
+    # 3. Fallback: active SSH connection this script is running over
+    if [[ -z "$port" ]]; then
+        port="$(ss -tnp 2>/dev/null | grep "ESTABLISHED" | grep sshd \
+            | grep -oP ':\K\d+(?=\s)' | sort -u | head -1)"
+    fi
+
+    # 4. Hard fallback
     echo "${port:-22}"
 }
 
@@ -638,6 +653,14 @@ setup_ufw() {
             # Only SSH
             ;;
     esac
+
+    # Safety check: SSH rule MUST be present before enabling UFW
+    if ! ufw status 2>/dev/null | grep -qE "${ssh_port}/(tcp|any)"; then
+        log_error "SAFETY ABORT: SSH port ${ssh_port} not found in UFW rules — refusing to enable UFW to avoid lockout"
+        log_error "Run manually: ufw allow ${ssh_port}/tcp && ufw enable"
+        STEP_STATUS["ufw"]="FAILED"
+        return 1
+    fi
 
     # Enable UFW non-interactively
     ufw --force enable &>/dev/null
