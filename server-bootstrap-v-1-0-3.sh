@@ -654,9 +654,10 @@ setup_ufw() {
             ;;
     esac
 
-    # Safety check: SSH rule MUST be present before enabling UFW
-    if ! ufw status 2>/dev/null | grep -qE "${ssh_port}/(tcp|any)"; then
-        log_error "SAFETY ABORT: SSH port ${ssh_port} not found in UFW rules — refusing to enable UFW to avoid lockout"
+    # Safety check: SSH rule MUST be present before enabling UFW.
+    # Use `ufw show added` — works when UFW is inactive (after reset).
+    if ! ufw show added 2>/dev/null | grep -qE "ufw allow ${ssh_port}"; then
+        log_error "SAFETY ABORT: SSH port ${ssh_port} not found in UFW added rules — refusing to enable UFW to avoid lockout"
         log_error "Run manually: ufw allow ${ssh_port}/tcp && ufw enable"
         STEP_STATUS["ufw"]="FAILED"
         return 1
