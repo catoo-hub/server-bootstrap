@@ -978,8 +978,10 @@ backend bk_ignored
     server _drop 127.0.0.1:1 weight 0
 
 # ── Upstream gate ─────────────────────────────────────────────────────────────
+# No `check`: gate uses accept-proxy, plain TCP health-check would be rejected
+# and mark the server permanently DOWN. Gate availability is monitored via logs.
 backend bk_upstream
-    server upstream ${GATE_ADDRESS}:${GATE_PORT} send-proxy-v2 check inter 10s rise 2 fall 3
+    server upstream ${GATE_ADDRESS}:${GATE_PORT} send-proxy-v2
 EOF
 
     log_info "HAProxy relay config written (→ ${GATE_ADDRESS}:${GATE_PORT})"
@@ -1389,8 +1391,9 @@ backend bk_ignored
     server _drop 127.0.0.1:1 weight 0
 
 # ── Local xray/remnanode ──────────────────────────────────────────────────────
+# No `check`: xray/remnanode uses accept-proxy, plain TCP health-check fails.
 backend bk_xray
-    server xray 127.0.0.1:${XRAY_PORT} send-proxy-v2 check inter 10s rise 2 fall 3
+    server xray 127.0.0.1:${XRAY_PORT} send-proxy-v2
 EOF
 
     log_info "HAProxy gate config written (listen :${GATE_LISTEN_PORT} → 127.0.0.1:${XRAY_PORT})"
