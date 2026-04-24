@@ -415,7 +415,7 @@ setup_ssh() {
         fi
     }
 
-    _sshd_set "PermitRootLogin"          "prohibit-password"
+    _sshd_set "PermitRootLogin"          "yes"
     _sshd_set "PasswordAuthentication"   "yes"   # keep yes until keys are confirmed
     _sshd_set "X11Forwarding"            "no"
     _sshd_set "MaxAuthTries"             "5"
