@@ -942,8 +942,7 @@ global
     log /dev/log local0
     maxconn 100000
     daemon
-    nbthread auto
-    stats socket /var/run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+    stats socket /var/run/haproxy/admin.sock mode 660 level admin
     stats timeout 30s
 
 defaults
@@ -957,17 +956,6 @@ defaults
     option          dontlognull
     retries         3
 
-# ── Stats HTTP page (localhost only, port 8404) ───────────────────────────────
-frontend ft_stats
-    bind 127.0.0.1:8404
-    mode http
-    stats enable
-    stats uri /stats
-    stats refresh 10s
-    stats show-legends
-    stats show-node
-    no log
-
 # ── Main inbound frontend ─────────────────────────────────────────────────────
 frontend ft_inbound
     bind *:${RELAY_PORT}
@@ -979,17 +967,18 @@ frontend ft_inbound
     use_backend bk_ignored  if !{ src -f /etc/haproxy/allowed.lst }
     default_backend bk_upstream
 
-# ── Silent-drop backends (no server = HAProxy closes silently, logs backend name)
+# ── Silent-drop backends ──────────────────────────────────────────────────────
+# Weight 0 dummy server → HAProxy rejects connection; backend name is logged.
 backend bk_blocked
     timeout connect 1s
+    server _drop 127.0.0.1:1 weight 0
 
 backend bk_ignored
     timeout connect 1s
+    server _drop 127.0.0.1:1 weight 0
 
 # ── Upstream gate ─────────────────────────────────────────────────────────────
 backend bk_upstream
-    option tcp-check
-    timeout check 5s
     server upstream ${GATE_ADDRESS}:${GATE_PORT} send-proxy-v2 check inter 10s rise 2 fall 3
 EOF
 
@@ -1296,7 +1285,10 @@ OVERRIDE
 
     # 9. Validate config then start (graceful reload if already running)
     log_info "Validating HAProxy config..."
-    if haproxy -c -f /etc/haproxy/haproxy.cfg; then
+    local haproxy_check_out
+    haproxy_check_out="$(haproxy -c -f /etc/haproxy/haproxy.cfg 2>&1)"
+    local haproxy_check_rc=$?
+    if [[ $haproxy_check_rc -eq 0 ]]; then
         systemctl enable haproxy &>/dev/null
         if systemctl is-active --quiet haproxy 2>/dev/null; then
             systemctl reload haproxy
@@ -1309,7 +1301,9 @@ OVERRIDE
         systemctl status haproxy --no-pager -l 2>/dev/null | head -10 | sed 's/^/    /'
         STEP_STATUS["haproxy"]="OK"
     else
-        log_error "HAProxy config validation FAILED — reverting backup"
+        log_error "HAProxy config validation FAILED (exit code: ${haproxy_check_rc}) — reverting backup"
+        log_error "haproxy -c error output:"
+        echo "$haproxy_check_out" | sed 's/^/    [haproxy-c] /' >&2
         local bak="${BACKUP_DIR}/haproxy.cfg.${TIMESTAMP}.bak"
         [[ -f "$bak" ]] && cp -a "$bak" /etc/haproxy/haproxy.cfg
         STEP_STATUS["haproxy"]="FAILED"
@@ -1362,8 +1356,7 @@ global
     log /dev/log local0
     maxconn 100000
     daemon
-    nbthread auto
-    stats socket /var/run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+    stats socket /var/run/haproxy/admin.sock mode 660 level admin
     stats timeout 30s
 
 defaults
@@ -1377,17 +1370,6 @@ defaults
     option          dontlognull
     retries         3
 
-# ── Stats page (localhost only) ───────────────────────────────────────────────
-frontend ft_stats
-    bind 127.0.0.1:8404
-    mode http
-    stats enable
-    stats uri /stats
-    stats refresh 10s
-    stats show-legends
-    stats show-node
-    no log
-
 # ── Gate inbound (from relay, carries PROXY protocol v2) ─────────────────────
 frontend ft_gate
     bind *:${GATE_LISTEN_PORT} accept-proxy
@@ -1397,16 +1379,17 @@ frontend ft_gate
     default_backend bk_xray
 
 # ── Silent-drop backends ──────────────────────────────────────────────────────
+# Weight 0 dummy server → HAProxy rejects connection; backend name is logged.
 backend bk_blocked
     timeout connect 1s
+    server _drop 127.0.0.1:1 weight 0
 
 backend bk_ignored
     timeout connect 1s
+    server _drop 127.0.0.1:1 weight 0
 
 # ── Local xray/remnanode ──────────────────────────────────────────────────────
 backend bk_xray
-    option tcp-check
-    timeout check 5s
     server xray 127.0.0.1:${XRAY_PORT} send-proxy-v2 check inter 10s rise 2 fall 3
 EOF
 
@@ -1478,7 +1461,10 @@ OVERRIDE
     mkdir -p /var/run/haproxy
     chown haproxy:haproxy /var/run/haproxy 2>/dev/null || true
 
-    if haproxy -c -f /etc/haproxy/haproxy.cfg; then
+    local haproxy_gate_check_out
+    haproxy_gate_check_out="$(haproxy -c -f /etc/haproxy/haproxy.cfg 2>&1)"
+    local haproxy_gate_check_rc=$?
+    if [[ $haproxy_gate_check_rc -eq 0 ]]; then
         systemctl enable haproxy &>/dev/null
         if systemctl is-active --quiet haproxy 2>/dev/null; then
             systemctl reload haproxy
@@ -1490,7 +1476,9 @@ OVERRIDE
         systemctl status haproxy --no-pager -l 2>/dev/null | head -10 | sed 's/^/    /'
         STEP_STATUS["haproxy_gate"]="OK"
     else
-        log_error "HAProxy gate config validation FAILED — reverting backup"
+        log_error "HAProxy gate config validation FAILED (exit code: ${haproxy_gate_check_rc}) — reverting backup"
+        log_error "haproxy -c error output:"
+        echo "$haproxy_gate_check_out" | sed 's/^/    [haproxy-c] /' >&2
         local bak="${BACKUP_DIR}/haproxy.cfg.${TIMESTAMP}.bak"
         [[ -f "$bak" ]] && cp -a "$bak" /etc/haproxy/haproxy.cfg
         STEP_STATUS["haproxy_gate"]="FAILED"
