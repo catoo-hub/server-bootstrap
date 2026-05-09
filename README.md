@@ -78,6 +78,9 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 > # ⚠️ Тестовый режим нового роутера
 > bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap-v-1-0-1.sh)
 >
+> # 🧪 Тестовая версия v1.1.0: relay + remnawave subscription-page на одном сервере
+> bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap-v-1-1-0.sh)
+>
 > # ✅ Правильно — неинтерактивный (работает и через пайп)
 > bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh) --mode node --non-interactive
 >
@@ -233,6 +236,68 @@ sudo bash server-bootstrap.sh --mode base --skip-update --non-interactive
 | 4 | Установка `mobile443-filter` (режим `install.sh`) |
 | ✗ | remnanode — **не устанавливается** |
 | ✗ | selfsteal — **не устанавливается** |
+
+#### 🧪 v1.1.0 — relay + subscription-page на одном сервере (тестовая ветка)
+
+В тестовой версии `server-bootstrap-v-1-1-0.sh` режим `relay` спрашивает: «Установить subscription-page на этот сервер?». При согласии скрипт ставит **дополнительно**:
+
+- Docker + Docker Compose (если ещё не стоит)
+- `remnawave/subscription-page:latest` в `/opt/remnawave/subscription` (бинд только на `127.0.0.1:3010`)
+- Caddy 2.9 в `/opt/remnawave/caddy` — выпускает Let's Encrypt сертификат и слушает `127.0.0.1:8443`
+- Открывает `80/tcp` в UFW (для ACME HTTP-01)
+
+**Как уживаются relay и subpage на одном :443 — SNI-роутинг в HAProxy:**
+
+```
+Клиент → :443 (HAProxy, mode tcp)
+            ├─ SNI = sub.example.com  → 127.0.0.1:8443 (Caddy → subscription-page:3010)
+            └─ всё остальное          → blocked.lst → allowed.lst → gate (как раньше)
+```
+
+Правило для subpage стоит **до** проверок IP-листов, поэтому клиенты подписочной страницы (включая мобильных операторов) **не попадают** под `blocked.lst` / `allowed.lst`. Фильтр работает только для основного relay-трафика.
+
+**Что нужно подготовить заранее:**
+
+1. **DNS A-запись** `sub.example.com` → IP relay-сервера
+2. **API-токен** в панели Remnawave: Settings → API Tokens
+3. **URL панели** (например `https://panel.example.com`)
+
+**Что нужно сделать после установки** (на сервере **панели**):
+
+```bash
+cd /opt/remnawave && nano .env
+# выставить:
+SUB_PUBLIC_DOMAIN=sub.example.com
+# применить:
+docker compose down remnawave && docker compose up -d
+```
+
+**Сертификат**: получится. HAProxy в relay-режиме `:80` не занимает, поэтому Caddy биндится `0.0.0.0:80` напрямую и проходит ACME HTTP-01 challenge без проблем.
+
+**Аргументы CLI (v1.1.0):**
+
+| Флаг | Описание |
+|------|----------|
+| `--with-subpage` | Включить установку subscription-page вместе с relay |
+| `--subscription-domain <d>` | Домен страницы (например `sub.example.com`) |
+| `--panel-url <url>` | URL панели Remnawave (`https://panel.example.com`) |
+| `--api-token <token>` | API-токен из панели |
+| `--sub-prefix <prefix>` | (опц.) `CUSTOM_SUB_PREFIX` для путей подписок |
+
+**Полностью неинтерактивный пример:**
+
+```bash
+sudo bash server-bootstrap-v-1-1-0.sh \
+    --mode relay \
+    --gate-address 1.2.3.4 \
+    --with-subpage \
+    --subscription-domain sub.example.com \
+    --panel-url https://panel.example.com \
+    --api-token YOUR_TOKEN_HERE \
+    --non-interactive
+```
+
+**Удаление:** в меню `--uninstall` появляется пункт `subpage` — он гасит оба контейнера, удаляет `/opt/remnawave/{subscription,caddy}` и docker-volume `caddy-ssl-data`.
 
 ### `custom` — Пошаговый выбор
 
@@ -645,6 +710,9 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 > # ⚠️ Test version of new Router mode (WL)
 > bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap-v-1-0-1.sh)
 >
+> # 🧪 Test build v1.1.0: relay + remnawave subscription-page on the same server
+> bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap-v-1-1-0.sh)
+>
 > # ✅ Correct — non-interactive works with both pipe and process substitution
 > bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh) --mode node --non-interactive
 >
@@ -800,6 +868,68 @@ Everything from `base`, plus:
 | 4 | Install `mobile443-filter` (`install.sh` mode) |
 | ✗ | remnanode — **not installed** |
 | ✗ | selfsteal — **not installed** |
+
+#### 🧪 v1.1.0 — relay + subscription-page on the same host (test build)
+
+The test build `server-bootstrap-v-1-1-0.sh` adds an interactive question to relay mode: "Install subscription-page on this server?". When accepted, the script additionally installs:
+
+- Docker + Docker Compose (if missing)
+- `remnawave/subscription-page:latest` at `/opt/remnawave/subscription` (binds `127.0.0.1:3010` only)
+- Caddy 2.9 at `/opt/remnawave/caddy` — issues a Let's Encrypt certificate and listens on `127.0.0.1:8443`
+- Opens `80/tcp` in UFW (for ACME HTTP-01)
+
+**How relay and subpage share :443 — HAProxy SNI routing:**
+
+```
+Client → :443 (HAProxy, mode tcp)
+            ├─ SNI = sub.example.com  → 127.0.0.1:8443 (Caddy → subscription-page:3010)
+            └─ anything else          → blocked.lst → allowed.lst → gate (unchanged)
+```
+
+The subpage SNI rule is matched **before** the IP list checks, so subscription-page clients (including mobile operators) **bypass** `blocked.lst` / `allowed.lst`. The IP filter applies only to relay traffic.
+
+**Prerequisites:**
+
+1. **DNS A-record** `sub.example.com` → relay server IP
+2. **API token** in Remnawave panel: Settings → API Tokens
+3. **Panel URL** (e.g. `https://panel.example.com`)
+
+**On the panel server**, after installing the subpage on the relay:
+
+```bash
+cd /opt/remnawave && nano .env
+# set:
+SUB_PUBLIC_DOMAIN=sub.example.com
+# apply:
+docker compose down remnawave && docker compose up -d
+```
+
+**Certificate**: works fine. Relay HAProxy does NOT bind `:80`, so Caddy attaches to `0.0.0.0:80` directly and clears the ACME HTTP-01 challenge.
+
+**CLI flags (v1.1.0):**
+
+| Flag | Description |
+|------|-------------|
+| `--with-subpage` | Co-install subscription-page with relay |
+| `--subscription-domain <d>` | Page domain (e.g. `sub.example.com`) |
+| `--panel-url <url>` | Remnawave panel URL (`https://panel.example.com`) |
+| `--api-token <token>` | API token from the panel |
+| `--sub-prefix <prefix>` | (optional) `CUSTOM_SUB_PREFIX` for subscription paths |
+
+**Fully non-interactive example:**
+
+```bash
+sudo bash server-bootstrap-v-1-1-0.sh \
+    --mode relay \
+    --gate-address 1.2.3.4 \
+    --with-subpage \
+    --subscription-domain sub.example.com \
+    --panel-url https://panel.example.com \
+    --api-token YOUR_TOKEN_HERE \
+    --non-interactive
+```
+
+**Uninstall:** the `--uninstall` menu gains a `subpage` entry — it stops both containers, removes `/opt/remnawave/{subscription,caddy}` and the `caddy-ssl-data` docker volume.
 
 ### `custom` — Step-by-step Selection
 
