@@ -1790,22 +1790,68 @@ install_docker() {
     fi
 
     if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would install Docker via official script"
+        log_dry "Would install Docker via official script (with docker.io fallback)"
         STEP_STATUS["docker"]="DRY"
         return 0
     fi
 
-    # Official Docker install
-    curl -fsSL https://get.docker.com | sh
-    systemctl enable docker &>/dev/null
-    systemctl start  docker &>/dev/null
-    log_ok "Docker installed: $(docker --version 2>/dev/null)"
+    # Clean up any stale Docker apt source from a previous failed manual install.
+    # A 403 from download.docker.com leaves an apt source pointing at an
+    # unreachable repo, which breaks every later `apt-get update`.
+    if [[ -f /etc/apt/sources.list.d/docker.list ]] && \
+       ! curl -fsS --max-time 5 -I https://download.docker.com/linux/ubuntu/dists/ >/dev/null 2>&1; then
+        log_warn "Stale /etc/apt/sources.list.d/docker.list detected and download.docker.com unreachable — removing"
+        rm -f /etc/apt/sources.list.d/docker.list \
+              /etc/apt/keyrings/docker.gpg \
+              /etc/apt/keyrings/docker-archive-keyring.gpg 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null || true
+    fi
 
-    # Docker Compose v2 (plugin)
+    # 1) Try the official get.docker.com installer (uses download.docker.com).
+    #    Some regions / CDNs return 403 — in that case fall back to distro Docker.
+    log_info "Trying official Docker install (get.docker.com)..."
+    local docker_ok=false
+    if curl -fsSL --max-time 30 https://get.docker.com -o /tmp/get-docker.sh 2>/dev/null \
+       && sh /tmp/get-docker.sh 2>&1 | tail -20 | sed 's/^/    [docker-installer] /'; then
+        if command -v docker &>/dev/null; then
+            docker_ok=true
+            log_ok "Docker installed via get.docker.com: $(docker --version 2>/dev/null)"
+        fi
+    fi
+    rm -f /tmp/get-docker.sh 2>/dev/null || true
+
+    # 2) Fallback: distro Docker (docker.io + docker-compose-v2 on Ubuntu/Debian).
+    if [[ "$docker_ok" != true ]]; then
+        log_warn "Official Docker install unavailable (CDN block?) — falling back to distro 'docker.io'"
+        # Make sure leftover broken Docker apt source doesn't poison apt-get update
+        rm -f /etc/apt/sources.list.d/docker.list 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null || true
+        if install_packages docker.io docker-compose-v2; then
+            docker_ok=true
+            log_ok "Docker installed from distro repo: $(docker --version 2>/dev/null)"
+        else
+            # Older distros may not have docker-compose-v2 — try just docker.io
+            install_packages docker.io && docker_ok=true
+            install_packages docker-compose-plugin 2>/dev/null || \
+            install_packages docker-compose        2>/dev/null || true
+        fi
+    fi
+
+    if [[ "$docker_ok" != true ]]; then
+        log_error "All Docker install paths failed"
+        STEP_STATUS["docker"]="FAILED"
+        return 1
+    fi
+
+    systemctl enable docker &>/dev/null || true
+    systemctl start  docker &>/dev/null || true
+
+    # Ensure Compose v2 is reachable as `docker compose ...`
     if ! docker compose version &>/dev/null; then
         install_packages docker-compose-plugin 2>/dev/null || \
+        install_packages docker-compose-v2     2>/dev/null || \
         install_packages docker-compose        2>/dev/null || \
-        log_warn "docker-compose plugin not available in repo"
+        log_warn "docker compose plugin not available in repo"
     fi
     log_ok "Docker Compose: $(docker compose version 2>/dev/null || docker-compose --version 2>/dev/null || echo 'unavailable')"
     STEP_STATUS["docker"]="OK"
