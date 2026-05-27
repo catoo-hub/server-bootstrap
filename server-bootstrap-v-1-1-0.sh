@@ -1686,6 +1686,18 @@ install_remnanode() {
         return 0
     fi
 
+    # remnanode runs in a Docker container — ensure Docker is available first.
+    # On fresh Ubuntu 24.04 / Debian 12 Docker is not preinstalled, and the
+    # upstream installer assumes it is, which causes a silent failure.
+    if ! command -v docker &>/dev/null; then
+        log_info "Docker not found — installing before remnanode..."
+        install_docker || {
+            log_error "Docker install failed — cannot proceed with remnanode"
+            STEP_STATUS["remnanode"]="FAILED"
+            return 1
+        }
+    fi
+
     log_info "Running remnanode installer..."
     if bash <(curl -Ls "$REMNANODE_URL") @ install; then
         log_ok "remnanode installed successfully"
@@ -1731,6 +1743,16 @@ install_selfsteal() {
         log_error "Cannot reach selfsteal URL: ${SELFSTEAL_URL}"
         STEP_STATUS["selfsteal"]="FAILED"
         return 1
+    fi
+
+    # selfsteal also runs in Docker — same pre-check as remnanode.
+    if ! command -v docker &>/dev/null; then
+        log_info "Docker not found — installing before selfsteal..."
+        install_docker || {
+            log_error "Docker install failed — cannot proceed with selfsteal"
+            STEP_STATUS["selfsteal"]="FAILED"
+            return 1
+        }
     fi
 
     if [[ "$DRY_RUN" == true ]]; then
