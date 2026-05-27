@@ -882,17 +882,36 @@ _install_haproxy_28() {
         fi
 
         log_warn "Debian distro repo does not provide HAProxy 2.8, using haproxy.debian.net"
-        curl -fsSL https://haproxy.debian.net/bernat.debian.net.gpg \
-            | gpg --dearmor -o /usr/share/keyrings/haproxy.debian.net.gpg
+        # Maintainer key — note the URL uses bernat.debian.org (NOT .net)
+        if ! curl -fsSL https://haproxy.debian.net/bernat.debian.org.gpg \
+            | gpg --dearmor -o /usr/share/keyrings/haproxy.debian.net.gpg; then
+            log_error "Failed to fetch HAProxy maintainer GPG key from haproxy.debian.net"
+            log_error "Falling back to generic distro haproxy (version may be < 2.8)"
+            rm -f /etc/apt/sources.list.d/haproxy.list 2>/dev/null || true
+            DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy \
+                -o Dpkg::Options::="--force-confdef" \
+                -o Dpkg::Options::="--force-confold" && {
+                log_ok "HAProxy installed (distro fallback): $(haproxy -v 2>/dev/null | head -1)"
+                return 0
+            }
+            log_error "All HAProxy install paths failed"
+            return 1
+        fi
 
         echo "deb [signed-by=/usr/share/keyrings/haproxy.debian.net.gpg] \
 https://haproxy.debian.net bookworm-backports-2.8 main" \
             > /etc/apt/sources.list.d/haproxy.list
 
-        DEBIAN_FRONTEND=noninteractive $PKG_MGR update -qq
-        DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy=2.8.\* \
+        DEBIAN_FRONTEND=noninteractive $PKG_MGR update -qq || {
+            log_error "apt-get update failed after adding haproxy.debian.net repo"
+            return 1
+        }
+        if ! DEBIAN_FRONTEND=noninteractive $PKG_MGR install -y haproxy=2.8.\* \
             -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold"
+            -o Dpkg::Options::="--force-confold"; then
+            log_error "haproxy=2.8.* install failed from haproxy.debian.net"
+            return 1
+        fi
 
         log_ok "HAProxy installed from haproxy.debian.net: $(haproxy -v 2>/dev/null | head -1)"
     fi
