@@ -2,13 +2,13 @@
 # ==============================================================================
 #  server-bootstrap.sh — Production-ready server/node setup script
 #  Supports: Debian 12+ / Ubuntu 22.04+  |  Requires: root
-#  Modes: base | node | gate | relay | custom
+#  Modes: base | node | gate | relay | wg-relay | custom
 #
 #  Usage (interactive):   bash server-bootstrap.sh
 #  Usage (non-interactive): bash server-bootstrap.sh --mode node [--options]
 #
 #  Author:  Kitsura VPN
-#  Version: 1.0.4
+#  Version: 1.0.5
 # ==============================================================================
 
 set -euo pipefail
@@ -19,9 +19,9 @@ IFS=$'
 # SECTION 1 · CONSTANTS & GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="1.0.4"
+readonly SCRIPT_VERSION="1.0.5"
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly LOG_FILE="/var/log/server-bootstrap.log"
+LOG_FILE="/var/log/server-bootstrap.log"
 readonly CONFIG_FILE="/etc/server-bootstrap.conf"
 readonly STATE_FILE="/etc/server-bootstrap.state"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-custom-network.conf"
@@ -36,11 +36,14 @@ SKIP_SELFSTEAL=false
 SKIP_UPDATE=false
 RESUME=false       # Resume interrupted install (skip already-OK steps)
 UNINSTALL=false    # Uninstall mode
-MODE=""         # base | node | gate | relay | custom
-GATE_ADDRESS="" # used in relay mode
+MODE=""         # base | node | gate | relay | wg-relay | custom
+GATE_ADDRESS="" # used in relay / wg-relay mode
 RELAY_ADDRESS=""  # Relay: this server's IP (auto-detected if empty)
 RELAY_PORT="443"  # Relay: port haproxy binds on
 GATE_PORT="9443"  # Relay: port on gate (recommended: NOT 443)
+WG_RELAY_PORT="51820"      # wg-relay: UDP port exposed on this relay
+WG_GATE_PORT="51820"       # wg-relay: UDP port on gate WireGuard server
+WG_RELAY_SCHEDULER="rr"    # wg-relay: IPVS scheduler
 ALLOWED_LST_URL="https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/allowed.lst"  # Relay: URL to fetch allowed.lst; empty = use whois/RADB
 
 # ── Auto-detect pipe mode (curl URL | bash kills stdin) ───────────────────────
@@ -62,6 +65,7 @@ declare -A CHANGELOG=(
     ["1.0.2"]="allowed.lst: URL fetch mode (GitHub raw) with If-Modified-Since, cron 3x daily + 10/16/22h refresh. State engine: resume interrupted installs, per-step tracking. Uninstall menu per component."
     ["1.0.3"]="Version tracking in logs (session header). Changelog display on upgrade. Soft-update mode: backup configs before re-running changed components, merge/restore on failure."
     ["1.0.4"]="HAProxy relay: silent-drop backends (no blackhole server), daemon+nbthread+tunnel timeout, stats HTTP page :8404, systemd Restart=always drop-in, graceful reload. Gate mode: HAProxy-native blocking replaces mobile443-filter (blocked.lst+allowed.lst on gate). Monitoring: Prometheus+Grafana Docker Compose stack with HAProxy+Node Exporter dashboards, provisioned at /opt/monitoring."
+    ["1.0.5"]="New wg-relay mode: UDP WireGuard relay over IPVS NAT with nftables SNAT, persistent systemd restore, dedicated forwarding sysctl, and UFW UDP rule."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -596,6 +600,34 @@ apply_sysctl_router() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Detect current SSH port — checks sshd_config, running process, and active socket
+apply_sysctl_wg_relay() {
+    log_step "Applying wg-relay sysctl settings"
+
+    local wg_file="/etc/sysctl.d/99-wg-relay.conf"
+    backup_file "$wg_file"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would write wg-relay sysctl to ${wg_file}"
+        STEP_STATUS["sysctl_wg_relay"]="DRY"
+        return 0
+    fi
+
+    local tmpfile
+    tmpfile="$(mktemp)"
+    cat > "$tmpfile" <<EOF
+# Managed by server-bootstrap.sh (wg-relay mode) -- $(date)
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+EOF
+
+    mv "$tmpfile" "$wg_file"
+    sysctl --system &>/dev/null || sysctl -p "$wg_file" &>/dev/null || true
+    log_ok "wg-relay sysctl applied (${wg_file})"
+    STEP_STATUS["sysctl_wg_relay"]="OK"
+}
+
 _get_ssh_port() {
     local sshd_cfg="/etc/ssh/sshd_config"
     local port=""
@@ -666,6 +698,9 @@ setup_ufw() {
         relay)
             ufw allow "${RELAY_PORT:-443}/tcp" comment 'HAProxy relay' &>/dev/null
             ;;
+        wg-relay)
+            ufw allow "${WG_RELAY_PORT:-51820}/udp" comment 'WireGuard IPVS relay' &>/dev/null
+            ;;
         monitoring)
             ufw allow 3000/tcp comment 'Grafana' &>/dev/null
             ;;
@@ -692,6 +727,114 @@ setup_ufw() {
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 10 · FAIL2BAN
 # ─────────────────────────────────────────────────────────────────────────────
+
+setup_wg_relay_ipvs() {
+    log_step "Configuring WireGuard relay via IPVS"
+
+    if [[ -z "$GATE_ADDRESS" ]]; then
+        if [[ "$NON_INTERACTIVE" == true ]]; then
+            log_error "--gate-address is required in wg-relay mode"
+            STEP_STATUS["wg_relay_ipvs"]="FAILED"
+            return 1
+        fi
+        read -rp "  Enter GATE IP address for WireGuard relay: " GATE_ADDRESS
+    fi
+
+    if ! [[ "$GATE_ADDRESS" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        log_error "wg-relay currently expects an IPv4 gate address, got: ${GATE_ADDRESS}"
+        STEP_STATUS["wg_relay_ipvs"]="FAILED"
+        return 1
+    fi
+
+    if ! [[ "$WG_RELAY_PORT" =~ ^[0-9]+$ && "$WG_GATE_PORT" =~ ^[0-9]+$ ]]; then
+        log_error "WG ports must be numeric (relay=${WG_RELAY_PORT}, gate=${WG_GATE_PORT})"
+        STEP_STATUS["wg_relay_ipvs"]="FAILED"
+        return 1
+    fi
+
+    log_info "WG relay: 0.0.0.0:${WG_RELAY_PORT}/udp -> ${GATE_ADDRESS}:${WG_GATE_PORT}/udp"
+    log_info "IPVS scheduler: ${WG_RELAY_SCHEDULER}"
+    log_warn "Gate must already run WireGuard on ${GATE_ADDRESS}:${WG_GATE_PORT}/udp and accept this relay path"
+
+    install_packages ipvsadm nftables
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would configure IPVS UDP relay and nftables SNAT"
+        STEP_STATUS["wg_relay_ipvs"]="DRY"
+        return 0
+    fi
+
+    mkdir -p /etc/nftables.d
+
+    cat > /etc/modules-load.d/server-bootstrap-ipvs.conf <<'EOF'
+ip_vs
+ip_vs_rr
+ip_vs_wrr
+ip_vs_sh
+nf_conntrack
+nf_nat
+EOF
+
+    cat > /etc/nftables.d/server-bootstrap-wg-relay.nft <<EOF
+table ip server_bootstrap_wg_relay {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip protocol udp ip daddr ${GATE_ADDRESS} udp dport ${WG_GATE_PORT} masquerade
+    }
+}
+EOF
+
+    cat > /usr/local/sbin/server-bootstrap-wg-relay-apply <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+for mod in ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh nf_conntrack nf_nat; do
+    modprobe "\$mod" 2>/dev/null || true
+done
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null || true
+
+ipvsadm -D -u 0.0.0.0:${WG_RELAY_PORT} 2>/dev/null || true
+ipvsadm -A -u 0.0.0.0:${WG_RELAY_PORT} -s ${WG_RELAY_SCHEDULER}
+ipvsadm -a -u 0.0.0.0:${WG_RELAY_PORT} -r ${GATE_ADDRESS}:${WG_GATE_PORT} -m
+
+nft delete table ip server_bootstrap_wg_relay 2>/dev/null || true
+nft -f /etc/nftables.d/server-bootstrap-wg-relay.nft
+
+ipvsadm-save -n > /etc/ipvsadm.rules 2>/dev/null || true
+EOF
+    chmod 0755 /usr/local/sbin/server-bootstrap-wg-relay-apply
+
+    cat > /etc/systemd/system/server-bootstrap-wg-relay.service <<EOF
+[Unit]
+Description=server-bootstrap WireGuard IPVS relay
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/server-bootstrap-wg-relay-apply
+ExecStop=/bin/bash -c 'ipvsadm -D -u 0.0.0.0:${WG_RELAY_PORT} 2>/dev/null || true; nft delete table ip server_bootstrap_wg_relay 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now server-bootstrap-wg-relay.service >/dev/null
+
+    if ipvsadm -Ln -u "0.0.0.0:${WG_RELAY_PORT}" 2>/dev/null | grep -q "${GATE_ADDRESS}:${WG_GATE_PORT}"; then
+        log_ok "wg-relay IPVS active: 0.0.0.0:${WG_RELAY_PORT}/udp -> ${GATE_ADDRESS}:${WG_GATE_PORT}/udp"
+        STEP_STATUS["wg_relay_ipvs"]="OK"
+    else
+        log_error "IPVS service was not created as expected"
+        STEP_STATUS["wg_relay_ipvs"]="FAILED"
+        return 1
+    fi
+}
 
 setup_fail2ban() {
     log_step "Configuring Fail2Ban"
@@ -2107,6 +2250,15 @@ check_status_all() {
     fi
 
     echo -e "
+  ${BOLD}WG relay:${RESET}"
+    if command -v ipvsadm &>/dev/null && ipvsadm -Ln -u "0.0.0.0:${WG_RELAY_PORT:-51820}" &>/dev/null; then
+        ipvsadm -Ln -u "0.0.0.0:${WG_RELAY_PORT:-51820}" 2>/dev/null | sed 's/^/    /'
+        nft list table ip server_bootstrap_wg_relay 2>/dev/null | head -12 | sed 's/^/    /' || true
+    else
+        echo "    not configured"
+    fi
+
+    echo -e "
   ${BOLD}Docker:${RESET}"
     if command -v docker &>/dev/null; then
         docker --version 2>/dev/null | sed 's/^/    /'
@@ -2181,6 +2333,9 @@ BOOTSTRAP_VERSION="${SCRIPT_VERSION}"
 BOOTSTRAP_MODE="${MODE}"
 BOOTSTRAP_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 GATE_ADDRESS="${GATE_ADDRESS:-}"
+WG_RELAY_PORT="${WG_RELAY_PORT:-}"
+WG_GATE_PORT="${WG_GATE_PORT:-}"
+WG_RELAY_SCHEDULER="${WG_RELAY_SCHEDULER:-}"
 IS_CONTAINER="${IS_CONTAINER:-false}"
 OS_PRETTY="${OS_PRETTY:-}"
 EOF
@@ -2423,6 +2578,16 @@ run_soft_update() {
         fi
     fi
 
+    if [[ "${_STATE[sysctl_wg_relay]:-}" == "OK" ]]; then
+        state_save_step "sysctl_wg_relay" "UPDATING"
+        if apply_sysctl_wg_relay; then
+            state_save_step "sysctl_wg_relay" "OK"
+            log_ok "sysctl wg-relay updated"
+        else
+            state_save_step "sysctl_wg_relay" "FAILED"
+        fi
+    fi
+
     # ── ssh ──
     if [[ "${_STATE[ssh]:-}" == "OK" ]]; then
         log_step "Updating: SSH config"
@@ -2481,6 +2646,17 @@ run_soft_update() {
         fi
     done
 
+    if [[ "${_STATE[wg_relay_ipvs]:-}" == "OK" ]]; then
+        log_step "Updating: wg-relay IPVS"
+        state_save_step "wg_relay_ipvs" "UPDATING"
+        if setup_wg_relay_ipvs; then
+            state_save_step "wg_relay_ipvs" "OK"
+            log_ok "wg-relay IPVS updated"
+        else
+            state_save_step "wg_relay_ipvs" "FAILED"
+        fi
+    fi
+
     # Bump version in state after soft update
     state_save_step "_version_updated" "OK"
     log_ok "Soft update complete — v${_STATE_VERSION} → v${SCRIPT_VERSION}"
@@ -2534,6 +2710,29 @@ uninstall_haproxy() {
 
     state_save_step "haproxy" "REMOVED"
     log_ok "HAProxy removed"
+}
+
+uninstall_wg_relay() {
+    log_step "Uninstalling wg-relay"
+    [[ "$DRY_RUN" == true ]] && { log_dry "Would remove wg-relay IPVS/nft/systemd config"; return 0; }
+
+    systemctl stop server-bootstrap-wg-relay 2>/dev/null || true
+    systemctl disable server-bootstrap-wg-relay 2>/dev/null || true
+    ipvsadm -D -u "0.0.0.0:${WG_RELAY_PORT:-51820}" 2>/dev/null || true
+    nft delete table ip server_bootstrap_wg_relay 2>/dev/null || true
+
+    rm -f /etc/systemd/system/server-bootstrap-wg-relay.service
+    rm -f /usr/local/sbin/server-bootstrap-wg-relay-apply
+    rm -f /etc/nftables.d/server-bootstrap-wg-relay.nft
+    rm -f /etc/modules-load.d/server-bootstrap-ipvs.conf
+    rm -f /etc/sysctl.d/99-wg-relay.conf
+    rm -f /etc/ipvsadm.rules
+    systemctl daemon-reload 2>/dev/null || true
+    sysctl --system &>/dev/null || true
+
+    state_save_step "wg_relay_ipvs" "REMOVED"
+    state_save_step "sysctl_wg_relay" "REMOVED"
+    log_ok "wg-relay removed"
 }
 
 uninstall_fail2ban() {
@@ -2625,11 +2824,12 @@ uninstall_sysctl() {
     log_step "Reverting sysctl settings"
     [[ "$DRY_RUN" == true ]] && { log_dry "Would remove ${SYSCTL_FILE} and reload sysctl"; return 0; }
 
-    rm -f "$SYSCTL_FILE"
+    rm -f "$SYSCTL_FILE" /etc/sysctl.d/99-wg-relay.conf
     sysctl --system &>/dev/null || true
 
     state_save_step "sysctl_network" "REMOVED"
     state_save_step "sysctl_router"  "REMOVED"
+    state_save_step "sysctl_wg_relay" "REMOVED"
     log_ok "sysctl settings reverted"
 }
 
@@ -2648,7 +2848,7 @@ run_uninstall() {
     local components=()
     local labels=()
 
-    for step in haproxy haproxy_gate monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network; do
+    for step in haproxy haproxy_gate wg_relay_ipvs monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network; do
         local st="${_STATE[$step]:-unknown}"
         if [[ "$st" == "OK" || "$st" == "SKIPPED(resume)" ]]; then
             components+=("$step")
@@ -2664,7 +2864,7 @@ run_uninstall() {
     if [[ ${#components[@]} -eq 0 ]]; then
         log_warn "No installed components found in state file"
         log_info "You can still uninstall manually by selecting components below"
-        components=(haproxy haproxy_gate monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network)
+        components=(haproxy haproxy_gate wg_relay_ipvs monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network)
         for c in "${components[@]}"; do labels+=("$c"); done
     fi
 
@@ -2693,6 +2893,7 @@ run_uninstall() {
             [[ "${confirm,,}" != "yes" ]] && { log_info "Cancelled"; return 0; }
             uninstall_monitoring
             uninstall_haproxy
+            uninstall_wg_relay
             uninstall_remnanode
             uninstall_selfsteal
             uninstall_mobile443
@@ -2710,6 +2911,7 @@ run_uninstall() {
                 case "$target" in
                     haproxy)       uninstall_haproxy    ;;
                     haproxy_gate)  uninstall_haproxy    ;;
+                    wg_relay_ipvs) uninstall_wg_relay   ;;
                     monitoring)    uninstall_monitoring ;;
                     fail2ban)      uninstall_fail2ban   ;;
                     ufw)           uninstall_ufw        ;;
@@ -2717,7 +2919,7 @@ run_uninstall() {
                     selfsteal)     uninstall_selfsteal  ;;
                     mobile443)     uninstall_mobile443  ;;
                     docker)        uninstall_docker     ;;
-                    sysctl_network|sysctl_router) uninstall_sysctl ;;
+                    sysctl_network|sysctl_router|sysctl_wg_relay) uninstall_sysctl ;;
                     *) log_error "Unknown component: ${target}" ;;
                 esac
             else
@@ -2792,6 +2994,23 @@ run_relay() {
     STEP_STATUS["mode"]="relay/OK"
 }
 
+run_wg_relay() {
+    log_step "MODE: WG-RELAY (IPVS UDP director)"
+    # wg-relay only forwards WireGuard UDP to the gate. VLESS/Reality stays on the gate
+    # or in the client config via Xray dialerProxy.
+    apt_update
+    run_step "base_packages"    setup_base_packages
+    run_step "timezone"         setup_timezone
+    run_step "ssh"              setup_ssh
+    run_step "sysctl_network"   apply_sysctl_network
+    run_step "sysctl_wg_relay"  apply_sysctl_wg_relay
+    run_step "swap"             setup_swap
+    run_step "ufw"              setup_ufw "wg-relay"
+    run_step "fail2ban"         setup_fail2ban
+    run_step "wg_relay_ipvs"    setup_wg_relay_ipvs
+    STEP_STATUS["mode"]="wg-relay/OK"
+}
+
 run_custom() {
     log_step "MODE: CUSTOM (step-by-step)"
 
@@ -2825,7 +3044,7 @@ run_custom() {
 # SECTION 19 · INTERACTIVE MENU
 # ─────────────────────────────────────────────────────────────────────────────
 
-show_menu() {
+show_menu_legacy() {
     # Load state once for the menu session
     state_load
 
@@ -2863,7 +3082,8 @@ show_menu() {
             2) MODE="node";   show_summary_confirm && run_node   ;;
             3) MODE="gate";   show_summary_confirm && run_gate   ;;
             4) MODE="relay";  show_summary_confirm && run_relay  ;;
-            5) MODE="custom"; run_custom ;;
+            5) MODE="wg-relay"; show_summary_confirm && run_wg_relay ;;
+            6) MODE="custom"; run_custom ;;
             r|R)
                 if [[ -z "${_STATE_MODE:-}" ]]; then
                     log_warn "No previous installation state found"
@@ -2876,6 +3096,7 @@ show_menu() {
                         node)  run_node  ;;
                         gate)  run_gate  ;;
                         relay) run_relay ;;
+                        wg-relay) run_wg_relay ;;
                         *)     log_error "Cannot resume unknown mode: ${MODE}" ;;
                     esac
                 fi
@@ -2897,6 +3118,80 @@ show_menu() {
             break
         fi
         # Reset RESUME flag after one cycle so menu stays usable
+        RESUME=false
+    done
+}
+
+show_menu() {
+    state_load
+
+    while true; do
+        clear
+        print_header
+
+        if [[ -n "${_STATE_MODE:-}" ]]; then
+            echo -e "  ${YELLOW}Previous install found: mode=${_STATE_MODE} v${_STATE_VERSION}${RESET}"
+            echo -e "  ${GRAY}   Use 'r) Resume' to continue from where it stopped${RESET}"
+            echo ""
+        fi
+
+        echo -e "  ${BOLD}Select mode:${RESET}"
+        echo ""
+        echo -e "  ${CYAN}1)${RESET} base     - Base server preparation only"
+        echo -e "  ${CYAN}2)${RESET} node     - Regular node (base + remnanode + selfsteal)"
+        echo -e "  ${CYAN}3)${RESET} gate     - Gate node (base + remnanode + selfsteal + block-only filter)"
+        echo -e "  ${CYAN}4)${RESET} relay    - HAProxy Relay/Node Relay mode"
+        echo -e "  ${CYAN}5)${RESET} wg-relay - WireGuard UDP relay via IPVS"
+        echo -e "  ${CYAN}6)${RESET} custom   - Step-by-step component selection"
+        echo ""
+        echo -e "  ${YELLOW}r)${RESET} Resume"
+        echo -e "  ${YELLOW}s)${RESET} Status"
+        echo -e "  ${YELLOW}d)${RESET} Dry run (currently: ${DRY_RUN})"
+        echo -e "  ${YELLOW}v)${RESET} Verbose (currently: ${VERBOSE})"
+        echo -e "  ${RED}u)${RESET} Uninstall"
+        echo -e "  ${RED}q)${RESET} Quit"
+        echo ""
+        print_separator
+        read -rp "  Your choice: " choice
+
+        case "$choice" in
+            1) MODE="base";     show_summary_confirm && run_base ;;
+            2) MODE="node";     show_summary_confirm && run_node ;;
+            3) MODE="gate";     show_summary_confirm && run_gate ;;
+            4) MODE="relay";    show_summary_confirm && run_relay ;;
+            5) MODE="wg-relay"; show_summary_confirm && run_wg_relay ;;
+            6) MODE="custom";   run_custom ;;
+            r|R)
+                if [[ -z "${_STATE_MODE:-}" ]]; then
+                    log_warn "No previous installation state found"
+                else
+                    RESUME=true
+                    MODE="${_STATE_MODE}"
+                    log_info "Resuming ${MODE} (v${_STATE_VERSION} -> v${SCRIPT_VERSION})"
+                    show_summary_confirm && case "$MODE" in
+                        base)     run_base ;;
+                        node)     run_node ;;
+                        gate)     run_gate ;;
+                        relay)    run_relay ;;
+                        wg-relay) run_wg_relay ;;
+                        *)        log_error "Cannot resume unknown mode: ${MODE}" ;;
+                    esac
+                fi
+                ;;
+            u|U) run_uninstall; read -rp "  Press Enter to continue..." _ ;;
+            s|S) check_status_all; read -rp "  Press Enter to continue..." _ ;;
+            d|D) DRY_RUN=$([ "$DRY_RUN" == true ] && echo false || echo true); log_info "Dry-run: ${DRY_RUN}" ;;
+            v|V) VERBOSE=$([ "$VERBOSE" == true ] && echo false || echo true); log_info "Verbose: ${VERBOSE}" ;;
+            q|Q) echo -e "\n  ${GRAY}Exiting.${RESET}\n"; exit 0 ;;
+            *)   log_warn "Unknown option: ${choice}" ;;
+        esac
+
+        if [[ -n "$MODE" && "$MODE" != "custom" && "$RESUME" != true ]]; then
+            save_config
+            print_summary
+            check_status_all
+            break
+        fi
         RESUME=false
     done
 }
@@ -2925,8 +3220,10 @@ ${BOLD}Usage:${RESET}
   ${SCRIPT_NAME} [OPTIONS]
 
 ${BOLD}Options:${RESET}
-  --mode <mode>          Run mode: base | node | gate | relay | custom
-  --gate-address <ip>    Gate IP address (required for relay mode)
+  --mode <mode>          Run mode: base | node | gate | relay | wg-relay | custom
+  --gate-address <ip>    Gate IP address (required for relay / wg-relay mode)
+  --wg-port <port>       wg-relay UDP listen port on this relay (default: 51820)
+  --wg-gate-port <port>  wg-relay UDP WireGuard port on gate (default: 51820)
   --allowed-url <url>    URL to fetch allowed.lst (raw GitHub/CDN); empty = use whois/RADB
   --resume               Resume interrupted install (skip already-OK steps)
   --uninstall            Interactive uninstall menu
@@ -2949,6 +3246,9 @@ ${BOLD}Examples:${RESET}
   # Relay/Node Relay mode with gate address
   bash ${SCRIPT_NAME} --mode relay --gate-address 1.2.3.4 --non-interactive
 
+  # WireGuard UDP relay via IPVS
+  bash ${SCRIPT_NAME} --mode wg-relay --gate-address 1.2.3.4 --wg-port 51820 --wg-gate-port 51820 --non-interactive
+
   # Relay mode with pre-built allowlist from GitHub
   bash ${SCRIPT_NAME} --mode relay --gate-address 1.2.3.4 --allowed-url https://raw.githubusercontent.com/USER/REPO/main/allowed.lst --non-interactive
 
@@ -2970,6 +3270,9 @@ parse_args() {
             --relay-address)   RELAY_ADDRESS="$2"; shift 2 ;;
             --relay-port)      RELAY_PORT="$2";    shift 2 ;;
             --gate-port)       GATE_PORT="$2";     shift 2 ;;
+            --wg-port)         WG_RELAY_PORT="$2"; shift 2 ;;
+            --wg-gate-port)    WG_GATE_PORT="$2";  shift 2 ;;
+            --wg-scheduler)    WG_RELAY_SCHEDULER="$2"; shift 2 ;;
             --resume)          RESUME=true;          shift   ;;
             --uninstall)       UNINSTALL=true;        shift   ;;
             --verbose|-v)      VERBOSE=true;         shift   ;;
@@ -3095,9 +3398,10 @@ main() {
             node)   run_node    ;;
             gate)   run_gate    ;;
             relay)  run_relay   ;;
+            wg-relay) run_wg_relay ;;
             custom) run_custom  ;;
             *)
-                log_error "Unknown mode: '${MODE}'. Valid: base | node | gate | relay | custom"
+                log_error "Unknown mode: '${MODE}'. Valid: base | node | gate | relay | wg-relay | custom"
                 exit 1
                 ;;
         esac
@@ -3114,6 +3418,7 @@ main() {
             node)   show_summary_confirm && run_node    ;;
             gate)   show_summary_confirm && run_gate    ;;
             relay)  show_summary_confirm && run_relay   ;;
+            wg-relay) show_summary_confirm && run_wg_relay ;;
             custom) run_custom ;;
             *)
                 log_error "Unknown mode: '${MODE}'"

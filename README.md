@@ -734,6 +734,7 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 | `node` | Regular node | `--mode node` |
 | `gate` | Gate node | `--mode gate` |
 | `relay` | Relay / Node Relay mode | `--mode relay` |
+| `wg-relay` | WireGuard UDP relay via IPVS | `--mode wg-relay` |
 | `custom` | Step-by-step component selection | `--mode custom` |
 
 ---
@@ -743,8 +744,10 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 ```
 Flag                          Description
 ────────────────────────────────────────────────────────────────
---mode <mode>                 Mode: base | node | gate | relay | custom
---gate-address <ip>           Gate node IP address (required for relay mode)
+--mode <mode>                 Mode: base | node | gate | relay | wg-relay | custom
+--gate-address <ip>           Gate node IP address (required for relay / wg-relay mode)
+--wg-port <port>              wg-relay UDP listen port on this relay (default: 51820)
+--wg-gate-port <port>         wg-relay UDP WireGuard port on gate (default: 51820)
 --dry-run                     Simulation mode — no changes applied
 --verbose, -v                 Verbose/debug output
 --skip-selfsteal              Skip selfsteal installation
@@ -790,6 +793,20 @@ sudo bash server-bootstrap.sh --mode gate --skip-selfsteal --non-interactive
 ```bash
 sudo bash server-bootstrap.sh --mode relay --gate-address 185.100.200.5 --non-interactive
 ```
+
+### WireGuard UDP relay via IPVS
+
+```bash
+sudo bash server-bootstrap.sh --mode wg-relay --gate-address 185.100.200.5 --wg-port 51820 --wg-gate-port 51820 --non-interactive
+```
+
+This mode turns the BS/relay server into a UDP director:
+
+```text
+client -> BS:51820/udp -> IPVS + nft SNAT -> gate:51820/udp
+```
+
+The gate must already run a WireGuard server on `--wg-gate-port`.
 
 ### Step-by-step component selection
 
@@ -1243,6 +1260,40 @@ In OpenVZ/LXC some features are unavailable. Use limiting flags:
 ```bash
 sudo bash server-bootstrap.sh --mode base --skip-update --non-interactive
 ```
+
+---
+
+## wg-relay - WireGuard UDP Relay via IPVS
+
+`wg-relay` turns a BS/relay server into a UDP director for WireGuard:
+
+```text
+client -> BS:51820/udp -> IPVS + nft SNAT -> gate:51820/udp
+```
+
+Example:
+
+```bash
+sudo bash server-bootstrap.sh \
+  --mode wg-relay \
+  --gate-address 185.100.200.5 \
+  --wg-port 51820 \
+  --wg-gate-port 51820 \
+  --non-interactive
+```
+
+What it configures:
+
+| Step | Action |
+|------|--------|
+| 1 | Dedicated forwarding sysctl (`ip_forward=1`, `rp_filter=0`) |
+| 2 | UFW: open `--wg-port`/udp |
+| 3 | Install `ipvsadm` and `nftables` |
+| 4 | Configure IPVS UDP service `0.0.0.0:<wg-port>` -> `<gate-address>:<wg-gate-port>` |
+| 5 | Configure nftables SNAT so the gate replies back through the relay |
+| 6 | Install `server-bootstrap-wg-relay.service` to restore IPVS/nft rules after reboot |
+
+This mode does **not** install HAProxy, remnanode, selfsteal, or mobile443-filter. The gate must already run a WireGuard server on `--wg-gate-port`.
 
 ---
 
