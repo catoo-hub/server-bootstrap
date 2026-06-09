@@ -102,6 +102,7 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 | `node` | Обычная нода | `--mode node` |
 | `gate` | Gate-нода | `--mode gate` |
 | `relay` | Relay/Node Relay режим | `--mode relay` |
+| `wg-relay` | WireGuard UDP relay через IPVS | `--mode wg-relay` |
 | `custom` | Пошаговый выбор компонентов | `--mode custom` |
 
 ---
@@ -111,8 +112,10 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 ```
 Флаг                        Описание
 ────────────────────────────────────────────────────────────
---mode <mode>               Режим: base | node | gate | relay | custom
---gate-address <ip>         IP-адрес gate-ноды (обязателен для режима relay)
+--mode <mode>               Режим: base | node | gate | relay | wg-relay | custom
+--gate-address <ip>         IP-адрес gate-ноды (обязателен для relay / wg-relay)
+--wg-port <port>            UDP-порт WireGuard на relay/BS (по умолчанию: 51820)
+--wg-gate-port <port>       UDP-порт WireGuard на gate (по умолчанию: 51820)
 --dry-run                   Режим симуляции — изменения не применяются
 --verbose, -v               Подробный вывод (debug-уровень)
 --skip-selfsteal            Пропустить установку selfsteal
@@ -158,6 +161,20 @@ sudo bash server-bootstrap.sh --mode gate --skip-selfsteal --non-interactive
 ```bash
 sudo bash server-bootstrap.sh --mode relay --gate-address 185.100.200.5 --non-interactive
 ```
+
+### WireGuard UDP relay через IPVS
+
+```bash
+sudo bash server-bootstrap.sh --mode wg-relay --gate-address 185.100.200.5 --wg-port 51820 --wg-gate-port 51820 --non-interactive
+```
+
+Этот режим превращает BS/relay-сервер в UDP-директор:
+
+```text
+клиент -> BS:51820/udp -> IPVS + nft SNAT -> gate:51820/udp
+```
+
+На gate уже должен быть поднят WireGuard-сервер на `--wg-gate-port`.
 
 ### Пошаговый выбор компонентов
 
@@ -236,6 +253,27 @@ sudo bash server-bootstrap.sh --mode base --skip-update --non-interactive
 | 4 | Установка `mobile443-filter` (режим `install.sh`) |
 | ✗ | remnanode — **не устанавливается** |
 | ✗ | selfsteal — **не устанавливается** |
+
+### `wg-relay` — WireGuard UDP relay через IPVS
+
+Всё из `base`, плюс:
+
+| Шаг | Действие |
+|-----|----------|
+| 1 | Отдельные sysctl для форвардинга: `ip_forward=1`, `rp_filter=0` |
+| 2 | UFW: открыть `--wg-port`/udp |
+| 3 | Установка `ipvsadm` и `nftables` |
+| 4 | Настройка IPVS UDP-сервиса `0.0.0.0:<wg-port>` → `<gate-address>:<wg-gate-port>` |
+| 5 | Настройка nftables SNAT, чтобы gate отвечал обратно через relay |
+| 6 | Установка `server-bootstrap-wg-relay.service` для восстановления IPVS/nft правил после перезагрузки |
+
+Схема:
+
+```text
+клиент -> BS:51820/udp -> IPVS + nft SNAT -> gate:51820/udp
+```
+
+Этот режим **не ставит** HAProxy, remnanode, selfsteal и mobile443-filter. Он нужен для схемы, где клиентский Xray использует WireGuard outbound как `dialerProxy`, а BS-сервер только пробрасывает WireGuard UDP до gate. На gate должен уже работать WireGuard-сервер.
 
 #### 🧪 v1.1.0 — relay + subscription-page на одном сервере (тестовая ветка)
 
