@@ -8,7 +8,7 @@
 #  Usage (non-interactive): bash server-bootstrap.sh --mode node [--options]
 #
 #  Author:  Kitsura VPN
-#  Version: 1.0.6
+#  Version: 1.0.7
 # ==============================================================================
 
 set -euo pipefail
@@ -19,7 +19,7 @@ IFS=$'
 # SECTION 1 · CONSTANTS & GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="1.0.6"
+readonly SCRIPT_VERSION="1.0.7"
 readonly SCRIPT_NAME="$(basename "$0")"
 LOG_FILE="/var/log/server-bootstrap.log"
 readonly CONFIG_FILE="/etc/server-bootstrap.conf"
@@ -43,12 +43,12 @@ RELAY_PORT="443"  # Relay: port haproxy binds on
 GATE_PORT="9443"  # Relay: port on gate (recommended: NOT 443)
 WG_RELAY_PORT="51820"      # wg-relay: UDP port exposed on this relay
 WG_GATE_PORT="51820"       # wg-relay: UDP port on gate WireGuard server
-WG_RELAY_SCHEDULER="rr"    # wg-relay: IPVS scheduler
+WG_RELAY_SCHEDULER="rr"    # legacy option kept for old CLI calls; nft relay ignores it
 ALLOWED_LST_URL="https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/allowed.lst"  # Relay: URL to fetch allowed.lst; empty = use whois/RADB
 
 # Optional subscription-page co-install for relay / wg-relay modes.
 # relay:    HAProxy :443 routes SUBSCRIPTION_DOMAIN by SNI to local Caddy :8443.
-# wg-relay: Caddy owns TCP :80/:443 directly; IPVS handles only WireGuard UDP.
+# wg-relay: Caddy owns TCP :80/:443 directly; nft DNAT+SNAT handles only WireGuard UDP.
 WITH_SUBPAGE=false
 SUBSCRIPTION_DOMAIN=""
 PANEL_URL=""
@@ -83,7 +83,8 @@ declare -A CHANGELOG=(
     ["1.0.3"]="Version tracking in logs (session header). Changelog display on upgrade. Soft-update mode: backup configs before re-running changed components, merge/restore on failure."
     ["1.0.4"]="HAProxy relay: silent-drop backends (no blackhole server), daemon+nbthread+tunnel timeout, stats HTTP page :8404, systemd Restart=always drop-in, graceful reload. Gate mode: HAProxy-native blocking replaces mobile443-filter (blocked.lst+allowed.lst on gate). Monitoring: Prometheus+Grafana Docker Compose stack with HAProxy+Node Exporter dashboards, provisioned at /opt/monitoring."
     ["1.0.5"]="New wg-relay mode: UDP WireGuard relay over IPVS NAT with nftables SNAT, persistent systemd restore, dedicated forwarding sysctl, and UFW UDP rule."
-    ["1.0.6"]="Optional subscription-page co-install for relay and wg-relay. relay uses HAProxy SNI split to local Caddy; wg-relay publishes Caddy directly on TCP :80/:443 while IPVS handles WireGuard UDP."
+    ["1.0.6"]="Optional subscription-page co-install for relay and wg-relay. relay uses HAProxy SNI split to local Caddy; wg-relay publishes Caddy directly on TCP :80/:443 while the UDP relay handles WireGuard."
+    ["1.0.7"]="wg-relay now uses nftables DNAT+SNAT instead of IPVS. This preserves client-facing UDP/51820 on the BS relay while presenting the relay IP to the gate WireGuard server."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -721,7 +722,7 @@ setup_ufw() {
             fi
             ;;
         wg-relay)
-            ufw allow "${WG_RELAY_PORT:-51820}/udp" comment 'WireGuard IPVS relay' &>/dev/null
+            ufw allow "${WG_RELAY_PORT:-51820}/udp" comment 'WireGuard nft relay' &>/dev/null
             if [[ "${WITH_SUBPAGE:-false}" == true ]]; then
                 ufw allow 80/tcp  comment 'Subpage HTTP/ACME' &>/dev/null
                 ufw allow 443/tcp comment 'Subpage HTTPS' &>/dev/null
@@ -756,7 +757,7 @@ setup_ufw() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 setup_wg_relay_ipvs() {
-    log_step "Configuring WireGuard relay via IPVS"
+    log_step "Configuring WireGuard relay via nftables DNAT+SNAT"
 
     if [[ -z "$GATE_ADDRESS" ]]; then
         if [[ "$NON_INTERACTIVE" == true ]]; then
@@ -779,34 +780,50 @@ setup_wg_relay_ipvs() {
         return 1
     fi
 
-    log_info "WG relay: 0.0.0.0:${WG_RELAY_PORT}/udp -> ${GATE_ADDRESS}:${WG_GATE_PORT}/udp"
-    log_info "IPVS scheduler: ${WG_RELAY_SCHEDULER}"
+    if [[ -z "${RELAY_ADDRESS:-}" ]]; then
+        RELAY_ADDRESS="$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo '')"
+        [[ -n "$RELAY_ADDRESS" ]] && log_info "Auto-detected RELAY_ADDRESS: ${RELAY_ADDRESS}"
+    fi
+    if [[ -z "${RELAY_ADDRESS:-}" ]]; then
+        if [[ "$NON_INTERACTIVE" == true ]]; then
+            log_error "--relay-address is required when auto-detection fails in wg-relay mode"
+            STEP_STATUS["wg_relay_ipvs"]="FAILED"
+            return 1
+        fi
+        read -rp "  Enter RELAY (this server) IP for WireGuard relay: " RELAY_ADDRESS
+    fi
+    _validate_ip "$RELAY_ADDRESS" || {
+        log_error "Invalid RELAY_ADDRESS: ${RELAY_ADDRESS}"
+        STEP_STATUS["wg_relay_ipvs"]="FAILED"
+        return 1
+    }
+
+    log_info "WG relay: ${RELAY_ADDRESS}:${WG_RELAY_PORT}/udp -> ${GATE_ADDRESS}:${WG_GATE_PORT}/udp"
+    log_info "NAT: DNAT client->gate, SNAT gate-facing source to ${RELAY_ADDRESS}"
     log_warn "Gate must already run WireGuard on ${GATE_ADDRESS}:${WG_GATE_PORT}/udp and accept this relay path"
 
-    install_packages ipvsadm nftables
+    install_packages nftables
 
     if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would configure IPVS UDP relay and nftables SNAT"
+        log_dry "Would configure nftables UDP DNAT+SNAT relay"
         STEP_STATUS["wg_relay_ipvs"]="DRY"
         return 0
     fi
 
     mkdir -p /etc/nftables.d
 
-    cat > /etc/modules-load.d/server-bootstrap-ipvs.conf <<'EOF'
-ip_vs
-ip_vs_rr
-ip_vs_wrr
-ip_vs_sh
-nf_conntrack
-nf_nat
-EOF
+    rm -f /etc/modules-load.d/server-bootstrap-ipvs.conf
 
     cat > /etc/nftables.d/server-bootstrap-wg-relay.nft <<EOF
 table ip server_bootstrap_wg_relay {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip daddr ${RELAY_ADDRESS} udp dport ${WG_RELAY_PORT} dnat to ${GATE_ADDRESS}:${WG_GATE_PORT}
+    }
+
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
-        ip protocol udp ip daddr ${GATE_ADDRESS} udp dport ${WG_GATE_PORT} masquerade
+        ip daddr ${GATE_ADDRESS} udp dport ${WG_GATE_PORT} snat to ${RELAY_ADDRESS}
     }
 }
 EOF
@@ -815,7 +832,7 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-for mod in ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh nf_conntrack nf_nat; do
+for mod in nf_conntrack nf_nat; do
     modprobe "\$mod" 2>/dev/null || true
 done
 
@@ -823,20 +840,18 @@ sysctl -w net.ipv4.ip_forward=1 >/dev/null
 sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null || true
 sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null || true
 
-ipvsadm -D -u 0.0.0.0:${WG_RELAY_PORT} 2>/dev/null || true
-ipvsadm -A -u 0.0.0.0:${WG_RELAY_PORT} -s ${WG_RELAY_SCHEDULER}
-ipvsadm -a -u 0.0.0.0:${WG_RELAY_PORT} -r ${GATE_ADDRESS}:${WG_GATE_PORT} -m
+if command -v ipvsadm >/dev/null 2>&1; then
+    ipvsadm -C 2>/dev/null || true
+fi
 
 nft delete table ip server_bootstrap_wg_relay 2>/dev/null || true
 nft -f /etc/nftables.d/server-bootstrap-wg-relay.nft
-
-ipvsadm-save -n > /etc/ipvsadm.rules 2>/dev/null || true
 EOF
     chmod 0755 /usr/local/sbin/server-bootstrap-wg-relay-apply
 
     cat > /etc/systemd/system/server-bootstrap-wg-relay.service <<EOF
 [Unit]
-Description=server-bootstrap WireGuard IPVS relay
+Description=server-bootstrap WireGuard nftables relay
 Wants=network-online.target
 After=network-online.target
 
@@ -844,7 +859,7 @@ After=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/server-bootstrap-wg-relay-apply
-ExecStop=/bin/bash -c 'ipvsadm -D -u 0.0.0.0:${WG_RELAY_PORT} 2>/dev/null || true; nft delete table ip server_bootstrap_wg_relay 2>/dev/null || true'
+ExecStop=/bin/bash -c 'nft delete table ip server_bootstrap_wg_relay 2>/dev/null || true'
 
 [Install]
 WantedBy=multi-user.target
@@ -853,11 +868,11 @@ EOF
     systemctl daemon-reload
     systemctl enable --now server-bootstrap-wg-relay.service >/dev/null
 
-    if ipvsadm -Ln -u "0.0.0.0:${WG_RELAY_PORT}" 2>/dev/null | grep -q "${GATE_ADDRESS}:${WG_GATE_PORT}"; then
-        log_ok "wg-relay IPVS active: 0.0.0.0:${WG_RELAY_PORT}/udp -> ${GATE_ADDRESS}:${WG_GATE_PORT}/udp"
+    if nft list table ip server_bootstrap_wg_relay 2>/dev/null | grep -q "dnat to ${GATE_ADDRESS}:${WG_GATE_PORT}"; then
+        log_ok "wg-relay nft active: ${RELAY_ADDRESS}:${WG_RELAY_PORT}/udp -> ${GATE_ADDRESS}:${WG_GATE_PORT}/udp"
         STEP_STATUS["wg_relay_ipvs"]="OK"
     else
-        log_error "IPVS service was not created as expected"
+        log_error "nft relay table was not created as expected"
         STEP_STATUS["wg_relay_ipvs"]="FAILED"
         return 1
     fi
@@ -2495,9 +2510,8 @@ check_status_all() {
 
     echo -e "
   ${BOLD}WG relay:${RESET}"
-    if command -v ipvsadm &>/dev/null && ipvsadm -Ln -u "0.0.0.0:${WG_RELAY_PORT:-51820}" &>/dev/null; then
-        ipvsadm -Ln -u "0.0.0.0:${WG_RELAY_PORT:-51820}" 2>/dev/null | sed 's/^/    /'
-        nft list table ip server_bootstrap_wg_relay 2>/dev/null | head -12 | sed 's/^/    /' || true
+    if nft list table ip server_bootstrap_wg_relay &>/dev/null; then
+        nft list table ip server_bootstrap_wg_relay 2>/dev/null | sed 's/^/    /' || true
     else
         echo "    not configured"
     fi
@@ -2577,6 +2591,7 @@ BOOTSTRAP_VERSION="${SCRIPT_VERSION}"
 BOOTSTRAP_MODE="${MODE}"
 BOOTSTRAP_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 GATE_ADDRESS="${GATE_ADDRESS:-}"
+RELAY_ADDRESS="${RELAY_ADDRESS:-}"
 WG_RELAY_PORT="${WG_RELAY_PORT:-}"
 WG_GATE_PORT="${WG_GATE_PORT:-}"
 WG_RELAY_SCHEDULER="${WG_RELAY_SCHEDULER:-}"
@@ -2891,11 +2906,11 @@ run_soft_update() {
     done
 
     if [[ "${_STATE[wg_relay_ipvs]:-}" == "OK" ]]; then
-        log_step "Updating: wg-relay IPVS"
+        log_step "Updating: wg-relay nft relay"
         state_save_step "wg_relay_ipvs" "UPDATING"
         if setup_wg_relay_ipvs; then
             state_save_step "wg_relay_ipvs" "OK"
-            log_ok "wg-relay IPVS updated"
+            log_ok "wg-relay nft relay updated"
         else
             state_save_step "wg_relay_ipvs" "FAILED"
         fi
@@ -2958,11 +2973,11 @@ uninstall_haproxy() {
 
 uninstall_wg_relay() {
     log_step "Uninstalling wg-relay"
-    [[ "$DRY_RUN" == true ]] && { log_dry "Would remove wg-relay IPVS/nft/systemd config"; return 0; }
+    [[ "$DRY_RUN" == true ]] && { log_dry "Would remove wg-relay nft/systemd config"; return 0; }
 
     systemctl stop server-bootstrap-wg-relay 2>/dev/null || true
     systemctl disable server-bootstrap-wg-relay 2>/dev/null || true
-    ipvsadm -D -u "0.0.0.0:${WG_RELAY_PORT:-51820}" 2>/dev/null || true
+    ipvsadm -C 2>/dev/null || true
     nft delete table ip server_bootstrap_wg_relay 2>/dev/null || true
 
     rm -f /etc/systemd/system/server-bootstrap-wg-relay.service
@@ -3278,7 +3293,7 @@ run_relay() {
 }
 
 run_wg_relay() {
-    log_step "MODE: WG-RELAY (IPVS UDP director)"
+    log_step "MODE: WG-RELAY (nft UDP DNAT+SNAT)"
     # wg-relay only forwards WireGuard UDP to the gate. VLESS/Reality stays on the gate
     # or in the client config via Xray dialerProxy.
     apt_update
@@ -3441,7 +3456,7 @@ show_menu() {
         echo -e "  ${CYAN}2)${RESET} node     - Regular node (base + remnanode + selfsteal)"
         echo -e "  ${CYAN}3)${RESET} gate     - Gate node (base + remnanode + selfsteal + block-only filter)"
         echo -e "  ${CYAN}4)${RESET} relay    - HAProxy Relay/Node Relay mode"
-        echo -e "  ${CYAN}5)${RESET} wg-relay - WireGuard UDP relay via IPVS"
+        echo -e "  ${CYAN}5)${RESET} wg-relay - WireGuard UDP relay via nft DNAT+SNAT"
         echo -e "  ${CYAN}6)${RESET} custom   - Step-by-step component selection"
         echo ""
         echo -e "  ${YELLOW}r)${RESET} Resume"
@@ -3522,6 +3537,7 @@ ${BOLD}Usage:${RESET}
 ${BOLD}Options:${RESET}
   --mode <mode>          Run mode: base | node | gate | relay | wg-relay | custom
   --gate-address <ip>    Gate IP address (required for relay / wg-relay mode)
+  --relay-address <ip>   Relay public IP for wg-relay nft DNAT/SNAT (auto-detected if empty)
   --wg-port <port>       wg-relay UDP listen port on this relay (default: 51820)
   --wg-gate-port <port>  wg-relay UDP WireGuard port on gate (default: 51820)
   --allowed-url <url>    URL to fetch allowed.lst (raw GitHub/CDN); empty = use whois/RADB
@@ -3552,11 +3568,11 @@ ${BOLD}Examples:${RESET}
   # Relay/Node Relay mode with gate address
   bash ${SCRIPT_NAME} --mode relay --gate-address 1.2.3.4 --non-interactive
 
-  # WireGuard UDP relay via IPVS
-  bash ${SCRIPT_NAME} --mode wg-relay --gate-address 1.2.3.4 --wg-port 51820 --wg-gate-port 51820 --non-interactive
+  # WireGuard UDP relay via nft DNAT+SNAT
+  bash ${SCRIPT_NAME} --mode wg-relay --relay-address 5.6.7.8 --gate-address 1.2.3.4 --wg-port 51820 --wg-gate-port 51820 --non-interactive
 
   # wg-relay + subscription-page on the same server
-  bash ${SCRIPT_NAME} --mode wg-relay --gate-address 1.2.3.4 \\
+  bash ${SCRIPT_NAME} --mode wg-relay --relay-address 5.6.7.8 --gate-address 1.2.3.4 \\
        --with-subpage --subscription-domain sub.example.com \\
        --panel-url https://panel.example.com --api-token <TOKEN> \\
        --non-interactive

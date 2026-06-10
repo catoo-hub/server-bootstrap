@@ -102,7 +102,7 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 | `node` | Обычная нода | `--mode node` |
 | `gate` | Gate-нода | `--mode gate` |
 | `relay` | Relay/Node Relay режим | `--mode relay` |
-| `wg-relay` | WireGuard UDP relay через IPVS | `--mode wg-relay` |
+| `wg-relay` | WireGuard UDP relay через nftables DNAT+SNAT | `--mode wg-relay` |
 | `custom` | Пошаговый выбор компонентов | `--mode custom` |
 
 ---
@@ -167,16 +167,16 @@ sudo bash server-bootstrap.sh --mode gate --skip-selfsteal --non-interactive
 sudo bash server-bootstrap.sh --mode relay --gate-address 185.100.200.5 --non-interactive
 ```
 
-### WireGuard UDP relay через IPVS
+### WireGuard UDP relay через nftables DNAT+SNAT
 
 ```bash
-sudo bash server-bootstrap.sh --mode wg-relay --gate-address 185.100.200.5 --wg-port 51820 --wg-gate-port 51820 --non-interactive
+sudo bash server-bootstrap.sh --mode wg-relay --relay-address 203.0.113.10 --gate-address 185.100.200.5 --wg-port 51820 --wg-gate-port 51820 --non-interactive
 ```
 
 Этот режим превращает BS/relay-сервер в UDP-директор:
 
 ```text
-клиент -> BS:51820/udp -> IPVS + nft SNAT -> gate:51820/udp
+клиент -> BS:51820/udp -> nft DNAT+SNAT -> gate:51820/udp
 ```
 
 На gate уже должен быть поднят WireGuard-сервер на `--wg-gate-port`.
@@ -259,7 +259,7 @@ sudo bash server-bootstrap.sh --mode base --skip-update --non-interactive
 | ✗ | remnanode — **не устанавливается** |
 | ✗ | selfsteal — **не устанавливается** |
 
-### `wg-relay` — WireGuard UDP relay через IPVS
+### `wg-relay` — WireGuard UDP relay через nftables DNAT+SNAT
 
 Всё из `base`, плюс:
 
@@ -267,15 +267,15 @@ sudo bash server-bootstrap.sh --mode base --skip-update --non-interactive
 |-----|----------|
 | 1 | Отдельные sysctl для форвардинга: `ip_forward=1`, `rp_filter=0` |
 | 2 | UFW: открыть `--wg-port`/udp |
-| 3 | Установка `ipvsadm` и `nftables` |
-| 4 | Настройка IPVS UDP-сервиса `0.0.0.0:<wg-port>` → `<gate-address>:<wg-gate-port>` |
+| 3 | Установка `nftables` |
+| 4 | Настройка nft `prerouting` DNAT с `<relay-address>:<wg-port>` на `<gate-address>:<wg-gate-port>` |
 | 5 | Настройка nftables SNAT, чтобы gate отвечал обратно через relay |
-| 6 | Установка `server-bootstrap-wg-relay.service` для восстановления IPVS/nft правил после перезагрузки |
+| 6 | Установка `server-bootstrap-wg-relay.service` для восстановления nft правил после перезагрузки |
 
 Схема:
 
 ```text
-клиент -> BS:51820/udp -> IPVS + nft SNAT -> gate:51820/udp
+клиент -> BS:51820/udp -> nft DNAT+SNAT -> gate:51820/udp
 ```
 
 Этот режим **не ставит** HAProxy, remnanode, selfsteal и mobile443-filter. Он нужен для схемы, где клиентский Xray использует WireGuard outbound как `dialerProxy`, а BS-сервер только пробрасывает WireGuard UDP до gate. На gate должен уже работать WireGuard-сервер.
@@ -302,7 +302,7 @@ sudo bash server-bootstrap.sh --mode base --skip-update --non-interactive
 **Как работает wg-relay + subpage:**
 
 ```text
-WireGuard: клиент → BS:51820/udp → IPVS+nft → gate:51820/udp
+WireGuard: клиент → BS:51820/udp → nft DNAT+SNAT → gate:51820/udp
 Subpage:   клиент → BS:443/tcp   → Caddy → subscription-page:3010
 ```
 
@@ -352,6 +352,7 @@ sudo bash server-bootstrap.sh \
 ```bash
 sudo bash server-bootstrap.sh \
     --mode wg-relay \
+    --relay-address 5.6.7.8 \
     --gate-address 1.2.3.4 \
     --wg-port 51820 \
     --wg-gate-port 51820 \
@@ -799,7 +800,7 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 | `node` | Regular node | `--mode node` |
 | `gate` | Gate node | `--mode gate` |
 | `relay` | Relay / Node Relay mode | `--mode relay` |
-| `wg-relay` | WireGuard UDP relay via IPVS | `--mode wg-relay` |
+| `wg-relay` | WireGuard UDP relay via nftables DNAT+SNAT | `--mode wg-relay` |
 | `custom` | Step-by-step component selection | `--mode custom` |
 
 ---
@@ -864,16 +865,16 @@ sudo bash server-bootstrap.sh --mode gate --skip-selfsteal --non-interactive
 sudo bash server-bootstrap.sh --mode relay --gate-address 185.100.200.5 --non-interactive
 ```
 
-### WireGuard UDP relay via IPVS
+### WireGuard UDP relay via nftables DNAT+SNAT
 
 ```bash
-sudo bash server-bootstrap.sh --mode wg-relay --gate-address 185.100.200.5 --wg-port 51820 --wg-gate-port 51820 --non-interactive
+sudo bash server-bootstrap.sh --mode wg-relay --relay-address 203.0.113.10 --gate-address 185.100.200.5 --wg-port 51820 --wg-gate-port 51820 --non-interactive
 ```
 
 This mode turns the BS/relay server into a UDP director:
 
 ```text
-client -> BS:51820/udp -> IPVS + nft SNAT -> gate:51820/udp
+client -> BS:51820/udp -> nft DNAT+SNAT -> gate:51820/udp
 ```
 
 The gate must already run a WireGuard server on `--wg-gate-port`.
@@ -978,7 +979,7 @@ The subpage SNI rule is matched **before** the IP list checks, so subscription-p
 **How wg-relay + subpage works:**
 
 ```text
-WireGuard: client -> BS:51820/udp -> IPVS+nft -> gate:51820/udp
+WireGuard: client -> BS:51820/udp -> nft DNAT+SNAT -> gate:51820/udp
 Subpage:   client -> BS:443/tcp   -> Caddy -> subscription-page:3010
 ```
 
@@ -1028,6 +1029,7 @@ sudo bash server-bootstrap.sh \
 ```bash
 sudo bash server-bootstrap.sh \
     --mode wg-relay \
+    --relay-address 5.6.7.8 \
     --gate-address 1.2.3.4 \
     --wg-port 51820 \
     --wg-gate-port 51820 \
@@ -1355,12 +1357,12 @@ sudo bash server-bootstrap.sh --mode base --skip-update --non-interactive
 
 ---
 
-## wg-relay - WireGuard UDP Relay via IPVS
+## wg-relay - WireGuard UDP Relay via nftables DNAT+SNAT
 
 `wg-relay` turns a BS/relay server into a UDP director for WireGuard:
 
 ```text
-client -> BS:51820/udp -> IPVS + nft SNAT -> gate:51820/udp
+client -> BS:51820/udp -> nft DNAT+SNAT -> gate:51820/udp
 ```
 
 Example:
@@ -1368,6 +1370,7 @@ Example:
 ```bash
 sudo bash server-bootstrap.sh \
   --mode wg-relay \
+  --relay-address 203.0.113.10 \
   --gate-address 185.100.200.5 \
   --wg-port 51820 \
   --wg-gate-port 51820 \
@@ -1380,10 +1383,10 @@ What it configures:
 |------|--------|
 | 1 | Dedicated forwarding sysctl (`ip_forward=1`, `rp_filter=0`) |
 | 2 | UFW: open `--wg-port`/udp |
-| 3 | Install `ipvsadm` and `nftables` |
-| 4 | Configure IPVS UDP service `0.0.0.0:<wg-port>` -> `<gate-address>:<wg-gate-port>` |
+| 3 | Install `nftables` |
+| 4 | Configure nft `prerouting` DNAT from `<relay-address>:<wg-port>` to `<gate-address>:<wg-gate-port>` |
 | 5 | Configure nftables SNAT so the gate replies back through the relay |
-| 6 | Install `server-bootstrap-wg-relay.service` to restore IPVS/nft rules after reboot |
+| 6 | Install `server-bootstrap-wg-relay.service` to restore nft rules after reboot |
 
 This mode does **not** install HAProxy, remnanode, selfsteal, or mobile443-filter. The gate must already run a WireGuard server on `--wg-gate-port`.
 
