@@ -8,7 +8,7 @@
 #  Usage (non-interactive): bash server-bootstrap.sh --mode node [--options]
 #
 #  Author:  Kitsura VPN
-#  Version: 1.0.5
+#  Version: 1.0.6
 # ==============================================================================
 
 set -euo pipefail
@@ -19,7 +19,7 @@ IFS=$'
 # SECTION 1 · CONSTANTS & GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="1.0.5"
+readonly SCRIPT_VERSION="1.0.6"
 readonly SCRIPT_NAME="$(basename "$0")"
 LOG_FILE="/var/log/server-bootstrap.log"
 readonly CONFIG_FILE="/etc/server-bootstrap.conf"
@@ -46,6 +46,23 @@ WG_GATE_PORT="51820"       # wg-relay: UDP port on gate WireGuard server
 WG_RELAY_SCHEDULER="rr"    # wg-relay: IPVS scheduler
 ALLOWED_LST_URL="https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/allowed.lst"  # Relay: URL to fetch allowed.lst; empty = use whois/RADB
 
+# Optional subscription-page co-install for relay / wg-relay modes.
+# relay:    HAProxy :443 routes SUBSCRIPTION_DOMAIN by SNI to local Caddy :8443.
+# wg-relay: Caddy owns TCP :80/:443 directly; IPVS handles only WireGuard UDP.
+WITH_SUBPAGE=false
+SUBSCRIPTION_DOMAIN=""
+PANEL_URL=""
+PANEL_API_TOKEN=""
+CUSTOM_SUB_PREFIX=""
+SUBPAGE_DIR="/opt/web/subscription"
+SUBPAGE_CADDY_DIR="/opt/web/caddy"
+SUBPAGE_PARENT_DIR="/opt/web"
+SUBPAGE_APP_PORT="3010"
+SUBPAGE_LOCAL_TLS_PORT="8443"
+SUBPAGE_CONTAINER_NAME="web-subscription"
+SUBPAGE_CADDY_CONTAINER_NAME="web-caddy"
+SUBPAGE_NETWORK_NAME="web-network"
+
 # ── Auto-detect pipe mode (curl URL | bash kills stdin) ───────────────────────
 # If stdin is NOT a terminal, force non-interactive to protect all `read` calls.
 # Correct curl usage:  bash <(curl -Ls URL) [--args]   ← stdin = tty, OK
@@ -66,6 +83,7 @@ declare -A CHANGELOG=(
     ["1.0.3"]="Version tracking in logs (session header). Changelog display on upgrade. Soft-update mode: backup configs before re-running changed components, merge/restore on failure."
     ["1.0.4"]="HAProxy relay: silent-drop backends (no blackhole server), daemon+nbthread+tunnel timeout, stats HTTP page :8404, systemd Restart=always drop-in, graceful reload. Gate mode: HAProxy-native blocking replaces mobile443-filter (blocked.lst+allowed.lst on gate). Monitoring: Prometheus+Grafana Docker Compose stack with HAProxy+Node Exporter dashboards, provisioned at /opt/monitoring."
     ["1.0.5"]="New wg-relay mode: UDP WireGuard relay over IPVS NAT with nftables SNAT, persistent systemd restore, dedicated forwarding sysctl, and UFW UDP rule."
+    ["1.0.6"]="Optional subscription-page co-install for relay and wg-relay. relay uses HAProxy SNI split to local Caddy; wg-relay publishes Caddy directly on TCP :80/:443 while IPVS handles WireGuard UDP."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -697,9 +715,18 @@ setup_ufw() {
             ;;
         relay)
             ufw allow "${RELAY_PORT:-443}/tcp" comment 'HAProxy relay' &>/dev/null
+            if [[ "${WITH_SUBPAGE:-false}" == true ]]; then
+                ufw allow 80/tcp comment 'Subpage ACME' &>/dev/null
+                log_info "UFW: opened 80/tcp for subpage ACME"
+            fi
             ;;
         wg-relay)
             ufw allow "${WG_RELAY_PORT:-51820}/udp" comment 'WireGuard IPVS relay' &>/dev/null
+            if [[ "${WITH_SUBPAGE:-false}" == true ]]; then
+                ufw allow 80/tcp  comment 'Subpage HTTP/ACME' &>/dev/null
+                ufw allow 443/tcp comment 'Subpage HTTPS' &>/dev/null
+                log_info "UFW: opened 80/tcp and 443/tcp for subpage"
+            fi
             ;;
         monitoring)
             ufw allow 3000/tcp comment 'Grafana' &>/dev/null
@@ -1071,6 +1098,59 @@ _ask_relay_params() {
     log_info "GATE   : ${GATE_ADDRESS}:${GATE_PORT}"
 }
 
+# ── Ask / validate Subscription page parameters ──────────────────────────────
+_ask_subpage_params() {
+    if [[ -z "${SUBSCRIPTION_DOMAIN:-}" ]]; then
+        if [[ "$NON_INTERACTIVE" == true ]]; then
+            log_error "--subscription-domain is required when --with-subpage is set"
+            exit 1
+        fi
+        while true; do
+            read -rp "  Subscription page domain (e.g. sub.example.com): " SUBSCRIPTION_DOMAIN
+            [[ "$SUBSCRIPTION_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]] && break
+            log_warn "Invalid domain: '${SUBSCRIPTION_DOMAIN}'"
+        done
+    fi
+
+    if [[ -z "${PANEL_URL:-}" ]]; then
+        if [[ "$NON_INTERACTIVE" == true ]]; then
+            log_error "--panel-url is required when --with-subpage is set"
+            exit 1
+        fi
+        while true; do
+            read -rp "  Panel URL (https://panel.example.com): " PANEL_URL
+            [[ "$PANEL_URL" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/.*)?$ ]] && break
+            log_warn "Invalid URL: '${PANEL_URL}'"
+        done
+    fi
+    PANEL_URL="${PANEL_URL%/}"
+
+    if [[ -z "${PANEL_API_TOKEN:-}" ]]; then
+        if [[ "$NON_INTERACTIVE" == true ]]; then
+            log_error "--api-token is required when --with-subpage is set"
+            exit 1
+        fi
+        echo -e "  ${GRAY}Generate token in your panel: Settings → API Tokens${RESET}"
+        while true; do
+            read -rsp "  Panel API token (input hidden): " PANEL_API_TOKEN
+            echo ""
+            [[ -n "$PANEL_API_TOKEN" && ${#PANEL_API_TOKEN} -ge 16 ]] && break
+            log_warn "Token looks too short (need ≥16 chars). Re-enter."
+        done
+    fi
+
+    if [[ "$NON_INTERACTIVE" == false && -z "${CUSTOM_SUB_PREFIX:-}" ]]; then
+        read -rp "  Custom subscription path prefix (empty = none): " CUSTOM_SUB_PREFIX
+    fi
+
+    if [[ "${MODE:-}" == "wg-relay" ]]; then
+        log_info "SUBPAGE: ${SUBSCRIPTION_DOMAIN} → public Caddy :443 → :${SUBPAGE_APP_PORT}"
+    else
+        log_info "SUBPAGE: ${SUBSCRIPTION_DOMAIN} → 127.0.0.1:${SUBPAGE_LOCAL_TLS_PORT} (HAProxy SNI → Caddy → :${SUBPAGE_APP_PORT})"
+    fi
+    log_info "PANEL  : ${PANEL_URL}"
+}
+
 # ── Write HAProxy config (relay mode) ────────────────────────────────────────
 _write_haproxy_cfg() {
     local haproxy_cfg="/etc/haproxy/haproxy.cfg"
@@ -1079,6 +1159,19 @@ _write_haproxy_cfg() {
     # Ensure list files and socket dir exist before writing config
     mkdir -p /var/run/haproxy
     touch /etc/haproxy/blocked.lst /etc/haproxy/allowed.lst
+
+    local subpage_use_backend=""
+    local subpage_backend_block=""
+    if [[ "${WITH_SUBPAGE:-false}" == true && -n "${SUBSCRIPTION_DOMAIN:-}" ]]; then
+        subpage_use_backend="    # Subpage SNI route — bypasses IP allow/block lists by being matched first
+    use_backend bk_subpage if { req_ssl_sni -i ${SUBSCRIPTION_DOMAIN} }
+"
+        subpage_backend_block="
+# ── Subscription page (local Caddy on ${SUBPAGE_LOCAL_TLS_PORT}) ──────────────
+backend bk_subpage
+    server web-caddy 127.0.0.1:${SUBPAGE_LOCAL_TLS_PORT}
+"
+    fi
 
     cat > "$haproxy_cfg" <<EOF
 global
@@ -1105,7 +1198,7 @@ frontend ft_inbound
     tcp-request inspect-delay 5s
     tcp-request content accept if { req_ssl_hello_type 1 }
 
-    # Priority: blocked list first, then allowlist check
+${subpage_use_backend}    # Priority: blocked list first, then allowlist check
     use_backend bk_blocked if { src -f /etc/haproxy/blocked.lst }
     use_backend bk_ignored  if !{ src -f /etc/haproxy/allowed.lst }
     default_backend bk_upstream
@@ -1120,6 +1213,7 @@ backend bk_ignored
     timeout connect 1s
     server _drop 127.0.0.1:1 weight 0
 
+${subpage_backend_block}
 # ── Upstream gate ─────────────────────────────────────────────────────────────
 # No `check`: gate uses accept-proxy, plain TCP health-check would be rejected
 # and mark the server permanently DOWN. Gate availability is monitored via logs.
@@ -1812,6 +1906,156 @@ install_docker() {
     fi
     log_ok "Docker Compose: $(docker compose version 2>/dev/null || docker-compose --version 2>/dev/null || echo 'unavailable')"
     STEP_STATUS["docker"]="OK"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 15a · SUBSCRIPTION PAGE (relay / wg-relay co-install)
+# ─────────────────────────────────────────────────────────────────────────────
+
+setup_subpage() {
+    log_step "Installing subscription page"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would install Docker (if missing)"
+        log_dry "Would write ${SUBPAGE_DIR}/{docker-compose.yml,.env}"
+        log_dry "Would write ${SUBPAGE_CADDY_DIR}/{Caddyfile,docker-compose.yml}"
+        STEP_STATUS["subpage"]="DRY"
+        return 0
+    fi
+
+    _ask_subpage_params
+
+    if ! command -v docker &>/dev/null; then
+        log_info "Docker not found — installing..."
+        install_docker
+    fi
+    if ! docker compose version &>/dev/null 2>&1; then
+        log_error "Docker Compose not available — cannot install subscription page"
+        STEP_STATUS["subpage"]="FAILED"
+        return 1
+    fi
+
+    if ! docker network inspect "$SUBPAGE_NETWORK_NAME" &>/dev/null; then
+        docker network create "$SUBPAGE_NETWORK_NAME" &>/dev/null
+        log_info "Created docker network: ${SUBPAGE_NETWORK_NAME}"
+    fi
+
+    mkdir -p "$SUBPAGE_DIR" "$SUBPAGE_CADDY_DIR"
+
+    backup_file "${SUBPAGE_DIR}/docker-compose.yml" 2>/dev/null || true
+    cat > "${SUBPAGE_DIR}/docker-compose.yml" <<YAML
+services:
+    ${SUBPAGE_CONTAINER_NAME}:
+        image: remnawave/subscription-page:latest
+        container_name: ${SUBPAGE_CONTAINER_NAME}
+        hostname: ${SUBPAGE_CONTAINER_NAME}
+        restart: always
+        env_file:
+            - .env
+        ports:
+            - '127.0.0.1:${SUBPAGE_APP_PORT}:${SUBPAGE_APP_PORT}'
+        networks:
+            - ${SUBPAGE_NETWORK_NAME}
+networks:
+    ${SUBPAGE_NETWORK_NAME}:
+        name: ${SUBPAGE_NETWORK_NAME}
+        external: true
+YAML
+
+    backup_file "${SUBPAGE_DIR}/.env" 2>/dev/null || true
+    cat > "${SUBPAGE_DIR}/.env" <<EOF
+APP_PORT=${SUBPAGE_APP_PORT}
+REMNAWAVE_PANEL_URL=${PANEL_URL}
+REMNAWAVE_API_TOKEN=${PANEL_API_TOKEN}
+CUSTOM_SUB_PREFIX=${CUSTOM_SUB_PREFIX}
+EOF
+    chmod 600 "${SUBPAGE_DIR}/.env"
+    log_info "Wrote ${SUBPAGE_DIR}/.env (mode 600)"
+
+    local caddy_global caddy_ports verify_hint
+    if [[ "${MODE:-}" == "wg-relay" ]]; then
+        caddy_global="{
+    http_port 80
+    https_port 443
+}"
+        caddy_ports="            - '0.0.0.0:80:80'
+            - '0.0.0.0:443:443'"
+        verify_hint="direct Caddy"
+    else
+        caddy_global="{
+    http_port 80
+    https_port ${SUBPAGE_LOCAL_TLS_PORT}
+}"
+        caddy_ports="            - '0.0.0.0:80:80'
+            - '127.0.0.1:${SUBPAGE_LOCAL_TLS_PORT}:${SUBPAGE_LOCAL_TLS_PORT}'"
+        verify_hint="HAProxy SNI route"
+    fi
+
+    backup_file "${SUBPAGE_CADDY_DIR}/Caddyfile" 2>/dev/null || true
+    cat > "${SUBPAGE_CADDY_DIR}/Caddyfile" <<EOF
+${caddy_global}
+
+${SUBSCRIPTION_DOMAIN} {
+    reverse_proxy * http://${SUBPAGE_CONTAINER_NAME}:${SUBPAGE_APP_PORT}
+}
+EOF
+
+    backup_file "${SUBPAGE_CADDY_DIR}/docker-compose.yml" 2>/dev/null || true
+    cat > "${SUBPAGE_CADDY_DIR}/docker-compose.yml" <<YAML
+services:
+    ${SUBPAGE_CADDY_CONTAINER_NAME}:
+        image: caddy:2.9
+        container_name: ${SUBPAGE_CADDY_CONTAINER_NAME}
+        hostname: ${SUBPAGE_CADDY_CONTAINER_NAME}
+        restart: always
+        ports:
+${caddy_ports}
+        networks:
+            - ${SUBPAGE_NETWORK_NAME}
+        volumes:
+            - ./Caddyfile:/etc/caddy/Caddyfile
+            - caddy-ssl-data:/data
+networks:
+    ${SUBPAGE_NETWORK_NAME}:
+        name: ${SUBPAGE_NETWORK_NAME}
+        external: true
+volumes:
+    caddy-ssl-data:
+        driver: local
+        external: false
+        name: caddy-ssl-data
+YAML
+
+    log_info "Starting subscription page container..."
+    ( cd "$SUBPAGE_DIR" && docker compose up -d 2>&1 | sed 's/^/    [web] /' ) || {
+        log_error "Failed to start subscription page container"
+        STEP_STATUS["subpage"]="FAILED"
+        return 1
+    }
+
+    log_info "Starting Caddy reverse proxy..."
+    ( cd "$SUBPAGE_CADDY_DIR" && docker compose up -d 2>&1 | sed 's/^/    [caddy] /' ) || {
+        log_error "Failed to start Caddy"
+        STEP_STATUS["subpage"]="FAILED"
+        return 1
+    }
+
+    sleep 2
+    if docker ps --format '{{.Names}}' | grep -qx "$SUBPAGE_CONTAINER_NAME" \
+       && docker ps --format '{{.Names}}' | grep -qx "$SUBPAGE_CADDY_CONTAINER_NAME"; then
+        log_ok "Subscription page + Caddy running"
+    else
+        log_warn "One of the containers may not be running — check 'docker ps'"
+    fi
+
+    STEP_STATUS["subpage"]="OK"
+
+    echo ""
+    log_info "Subscription page is published at: https://${SUBSCRIPTION_DOMAIN}/<shortUuid>"
+    log_info "On your panel server, set in its .env file:"
+    echo -e "    ${CYAN}SUB_PUBLIC_DOMAIN=${SUBSCRIPTION_DOMAIN}${RESET}"
+    log_info "Then restart the panel container so the change takes effect."
+    log_info "Verify TLS via ${verify_hint}: curl -vI https://${SUBSCRIPTION_DOMAIN}/"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2735,6 +2979,25 @@ uninstall_wg_relay() {
     log_ok "wg-relay removed"
 }
 
+uninstall_subpage() {
+    log_step "Uninstalling subscription page"
+    [[ "$DRY_RUN" == true ]] && { log_dry "Would stop subpage+caddy containers, remove ${SUBPAGE_DIR} and ${SUBPAGE_CADDY_DIR}, drop caddy-ssl-data volume"; return 0; }
+
+    if [[ -f "${SUBPAGE_CADDY_DIR}/docker-compose.yml" ]]; then
+        ( cd "$SUBPAGE_CADDY_DIR" && docker compose down --volumes 2>/dev/null || true )
+    fi
+    if [[ -f "${SUBPAGE_DIR}/docker-compose.yml" ]]; then
+        ( cd "$SUBPAGE_DIR" && docker compose down --volumes 2>/dev/null || true )
+    fi
+    docker volume rm caddy-ssl-data 2>/dev/null || true
+    docker network rm "$SUBPAGE_NETWORK_NAME" 2>/dev/null || true
+    rm -rf "$SUBPAGE_DIR" "$SUBPAGE_CADDY_DIR"
+    rmdir "$SUBPAGE_PARENT_DIR" 2>/dev/null || true
+
+    state_save_step "subpage" "REMOVED"
+    log_ok "Subscription page removed"
+}
+
 uninstall_fail2ban() {
     log_step "Uninstalling fail2ban"
     [[ "$DRY_RUN" == true ]] && { log_dry "Would remove fail2ban and jail configs"; return 0; }
@@ -2848,7 +3111,7 @@ run_uninstall() {
     local components=()
     local labels=()
 
-    for step in haproxy haproxy_gate wg_relay_ipvs monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network; do
+    for step in haproxy haproxy_gate wg_relay_ipvs subpage monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network; do
         local st="${_STATE[$step]:-unknown}"
         if [[ "$st" == "OK" || "$st" == "SKIPPED(resume)" ]]; then
             components+=("$step")
@@ -2864,7 +3127,7 @@ run_uninstall() {
     if [[ ${#components[@]} -eq 0 ]]; then
         log_warn "No installed components found in state file"
         log_info "You can still uninstall manually by selecting components below"
-        components=(haproxy haproxy_gate wg_relay_ipvs monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network)
+        components=(haproxy haproxy_gate wg_relay_ipvs subpage monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network)
         for c in "${components[@]}"; do labels+=("$c"); done
     fi
 
@@ -2894,6 +3157,7 @@ run_uninstall() {
             uninstall_monitoring
             uninstall_haproxy
             uninstall_wg_relay
+            uninstall_subpage
             uninstall_remnanode
             uninstall_selfsteal
             uninstall_mobile443
@@ -2912,6 +3176,7 @@ run_uninstall() {
                     haproxy)       uninstall_haproxy    ;;
                     haproxy_gate)  uninstall_haproxy    ;;
                     wg_relay_ipvs) uninstall_wg_relay   ;;
+                    subpage)       uninstall_subpage    ;;
                     monitoring)    uninstall_monitoring ;;
                     fail2ban)      uninstall_fail2ban   ;;
                     ufw)           uninstall_ufw        ;;
@@ -2988,9 +3253,27 @@ run_relay() {
     run_step "sysctl_network"  apply_sysctl_network
     run_step "sysctl_router"   apply_sysctl_router
     run_step "swap"            setup_swap
+
+    if [[ "$NON_INTERACTIVE" == false && "${WITH_SUBPAGE:-false}" != true ]]; then
+        echo ""
+        echo -e "  ${BOLD}Optional:${RESET} install subscription page on this server?"
+        echo -e "  ${GRAY}It will share :443 with the relay via SNI routing — clients on the${RESET}"
+        echo -e "  ${GRAY}subscription domain bypass the IP allow/block lists.${RESET}"
+        read -rp "  Install subscription-page? [y/N]: " _sp_ans
+        if [[ "${_sp_ans,,}" == "y" ]]; then
+            WITH_SUBPAGE=true
+            _ask_subpage_params
+        fi
+    elif [[ "${WITH_SUBPAGE:-false}" == true ]]; then
+        _ask_subpage_params
+    fi
+
     run_step "ufw"             setup_ufw "relay"
     run_step "fail2ban"        setup_fail2ban
     run_step "haproxy"         setup_haproxy
+    if [[ "${WITH_SUBPAGE:-false}" == true ]]; then
+        run_step "subpage"     setup_subpage
+    fi
     STEP_STATUS["mode"]="relay/OK"
 }
 
@@ -3005,9 +3288,26 @@ run_wg_relay() {
     run_step "sysctl_network"   apply_sysctl_network
     run_step "sysctl_wg_relay"  apply_sysctl_wg_relay
     run_step "swap"             setup_swap
+
+    if [[ "$NON_INTERACTIVE" == false && "${WITH_SUBPAGE:-false}" != true ]]; then
+        echo ""
+        echo -e "  ${BOLD}Optional:${RESET} install subscription page on this server?"
+        echo -e "  ${GRAY}wg-relay uses UDP only; Caddy can publish subpage directly on :80/:443.${RESET}"
+        read -rp "  Install subscription-page? [y/N]: " _sp_ans
+        if [[ "${_sp_ans,,}" == "y" ]]; then
+            WITH_SUBPAGE=true
+            _ask_subpage_params
+        fi
+    elif [[ "${WITH_SUBPAGE:-false}" == true ]]; then
+        _ask_subpage_params
+    fi
+
     run_step "ufw"              setup_ufw "wg-relay"
     run_step "fail2ban"         setup_fail2ban
     run_step "wg_relay_ipvs"    setup_wg_relay_ipvs
+    if [[ "${WITH_SUBPAGE:-false}" == true ]]; then
+        run_step "subpage"      setup_subpage
+    fi
     STEP_STATUS["mode"]="wg-relay/OK"
 }
 
@@ -3225,6 +3525,12 @@ ${BOLD}Options:${RESET}
   --wg-port <port>       wg-relay UDP listen port on this relay (default: 51820)
   --wg-gate-port <port>  wg-relay UDP WireGuard port on gate (default: 51820)
   --allowed-url <url>    URL to fetch allowed.lst (raw GitHub/CDN); empty = use whois/RADB
+  --with-subpage         [relay|wg-relay] Co-install subscription page on this server
+  --subscription-domain <d>
+                         [subpage] Subscription page domain (e.g. sub.example.com)
+  --panel-url <url>      [subpage] Panel URL (https://panel.example.com)
+  --api-token <token>    [subpage] Panel API token (Settings → API Tokens)
+  --sub-prefix <prefix>  [subpage] Optional CUSTOM_SUB_PREFIX for subscription URLs
   --resume               Resume interrupted install (skip already-OK steps)
   --uninstall            Interactive uninstall menu
   --dry-run              Simulate — no changes applied
@@ -3248,6 +3554,18 @@ ${BOLD}Examples:${RESET}
 
   # WireGuard UDP relay via IPVS
   bash ${SCRIPT_NAME} --mode wg-relay --gate-address 1.2.3.4 --wg-port 51820 --wg-gate-port 51820 --non-interactive
+
+  # wg-relay + subscription-page on the same server
+  bash ${SCRIPT_NAME} --mode wg-relay --gate-address 1.2.3.4 \\
+       --with-subpage --subscription-domain sub.example.com \\
+       --panel-url https://panel.example.com --api-token <TOKEN> \\
+       --non-interactive
+
+  # HAProxy relay + subscription-page on the same server
+  bash ${SCRIPT_NAME} --mode relay --gate-address 1.2.3.4 \\
+       --with-subpage --subscription-domain sub.example.com \\
+       --panel-url https://panel.example.com --api-token <TOKEN> \\
+       --non-interactive
 
   # Relay mode with pre-built allowlist from GitHub
   bash ${SCRIPT_NAME} --mode relay --gate-address 1.2.3.4 --allowed-url https://raw.githubusercontent.com/USER/REPO/main/allowed.lst --non-interactive
@@ -3273,6 +3591,11 @@ parse_args() {
             --wg-port)         WG_RELAY_PORT="$2"; shift 2 ;;
             --wg-gate-port)    WG_GATE_PORT="$2";  shift 2 ;;
             --wg-scheduler)    WG_RELAY_SCHEDULER="$2"; shift 2 ;;
+            --with-subpage)         WITH_SUBPAGE=true;            shift   ;;
+            --subscription-domain)  SUBSCRIPTION_DOMAIN="$2";     shift 2 ;;
+            --panel-url)            PANEL_URL="$2";               shift 2 ;;
+            --api-token)            PANEL_API_TOKEN="$2";         shift 2 ;;
+            --sub-prefix)           CUSTOM_SUB_PREFIX="$2";       shift 2 ;;
             --resume)          RESUME=true;          shift   ;;
             --uninstall)       UNINSTALL=true;        shift   ;;
             --verbose|-v)      VERBOSE=true;         shift   ;;

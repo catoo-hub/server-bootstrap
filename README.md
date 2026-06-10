@@ -78,8 +78,8 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 > # ⚠️ Тестовый режим нового роутера
 > bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap-v-1-0-1.sh)
 >
-> # 🧪 Тестовая версия v1.1.0: relay + remnawave subscription-page на одном сервере
-> bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap-v-1-1-0.sh)
+> # 🧪 relay / wg-relay + subscription-page на одном сервере
+> bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh)
 >
 > # ✅ Правильно — неинтерактивный (работает и через пайп)
 > bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh) --mode node --non-interactive
@@ -116,6 +116,11 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 --gate-address <ip>         IP-адрес gate-ноды (обязателен для relay / wg-relay)
 --wg-port <port>            UDP-порт WireGuard на relay/BS (по умолчанию: 51820)
 --wg-gate-port <port>       UDP-порт WireGuard на gate (по умолчанию: 51820)
+--with-subpage              Установить subscription-page вместе с relay / wg-relay
+--subscription-domain <d>   Домен страницы подписки
+--panel-url <url>           URL панели Remnawave
+--api-token <token>         API-токен панели
+--sub-prefix <prefix>       Опциональный CUSTOM_SUB_PREFIX
 --dry-run                   Режим симуляции — изменения не применяются
 --verbose, -v               Подробный вывод (debug-уровень)
 --skip-selfsteal            Пропустить установку selfsteal
@@ -275,14 +280,14 @@ sudo bash server-bootstrap.sh --mode base --skip-update --non-interactive
 
 Этот режим **не ставит** HAProxy, remnanode, selfsteal и mobile443-filter. Он нужен для схемы, где клиентский Xray использует WireGuard outbound как `dialerProxy`, а BS-сервер только пробрасывает WireGuard UDP до gate. На gate должен уже работать WireGuard-сервер.
 
-#### 🧪 v1.1.0 — relay + subscription-page на одном сервере (тестовая ветка)
+#### 🧪 relay / wg-relay + subscription-page на одном сервере
 
-В тестовой версии `server-bootstrap-v-1-1-0.sh` режим `relay` спрашивает: «Установить subscription-page на этот сервер?». При согласии скрипт ставит **дополнительно**:
+В режимах `relay` и `wg-relay` скрипт спрашивает: «Установить subscription-page на этот сервер?». При согласии скрипт ставит **дополнительно**:
 
 - Docker + Docker Compose (если ещё не стоит)
-- `remnawave/subscription-page:latest` в `/opt/remnawave/subscription` (бинд только на `127.0.0.1:3010`)
-- Caddy 2.9 в `/opt/remnawave/caddy` — выпускает Let's Encrypt сертификат и слушает `127.0.0.1:8443`
-- Открывает `80/tcp` в UFW (для ACME HTTP-01)
+- `remnawave/subscription-page:latest` в `/opt/web/subscription` (бинд только на `127.0.0.1:3010`)
+- Caddy 2.9 в `/opt/web/caddy` — выпускает Let's Encrypt сертификат
+- Открывает нужные TCP-порты в UFW
 
 **Как уживаются relay и subpage на одном :443 — SNI-роутинг в HAProxy:**
 
@@ -294,9 +299,18 @@ sudo bash server-bootstrap.sh --mode base --skip-update --non-interactive
 
 Правило для subpage стоит **до** проверок IP-листов, поэтому клиенты подписочной страницы (включая мобильных операторов) **не попадают** под `blocked.lst` / `allowed.lst`. Фильтр работает только для основного relay-трафика.
 
+**Как работает wg-relay + subpage:**
+
+```text
+WireGuard: клиент → BS:51820/udp → IPVS+nft → gate:51820/udp
+Subpage:   клиент → BS:443/tcp   → Caddy → subscription-page:3010
+```
+
+`wg-relay` не ставит HAProxy и использует только UDP-порт WireGuard, поэтому Caddy может напрямую слушать `80/tcp` и `443/tcp`. Это проще и надёжнее, чем пытаться делать SNI-роутинг там, где TCP-прокси вообще не нужен.
+
 **Что нужно подготовить заранее:**
 
-1. **DNS A-запись** `sub.example.com` → IP relay-сервера
+1. **DNS A-запись** `sub.example.com` → IP relay/wg-relay-сервера
 2. **API-токен** в панели Remnawave: Settings → API Tokens
 3. **URL панели** (например `https://panel.example.com`)
 
@@ -310,13 +324,13 @@ SUB_PUBLIC_DOMAIN=sub.example.com
 docker compose down remnawave && docker compose up -d
 ```
 
-**Сертификат**: получится. HAProxy в relay-режиме `:80` не занимает, поэтому Caddy биндится `0.0.0.0:80` напрямую и проходит ACME HTTP-01 challenge без проблем.
+**Сертификат**: получится. В `relay` HAProxy не занимает `:80`, поэтому Caddy проходит ACME HTTP-01 через `80/tcp` и слушает TLS локально на `127.0.0.1:8443`. В `wg-relay` Caddy слушает `80/tcp` и `443/tcp` напрямую.
 
-**Аргументы CLI (v1.1.0):**
+**Аргументы CLI:**
 
 | Флаг | Описание |
 |------|----------|
-| `--with-subpage` | Включить установку subscription-page вместе с relay |
+| `--with-subpage` | Включить установку subscription-page вместе с `relay` или `wg-relay` |
 | `--subscription-domain <d>` | Домен страницы (например `sub.example.com`) |
 | `--panel-url <url>` | URL панели Remnawave (`https://panel.example.com`) |
 | `--api-token <token>` | API-токен из панели |
@@ -325,7 +339,7 @@ docker compose down remnawave && docker compose up -d
 **Полностью неинтерактивный пример:**
 
 ```bash
-sudo bash server-bootstrap-v-1-1-0.sh \
+sudo bash server-bootstrap.sh \
     --mode relay \
     --gate-address 1.2.3.4 \
     --with-subpage \
@@ -335,7 +349,20 @@ sudo bash server-bootstrap-v-1-1-0.sh \
     --non-interactive
 ```
 
-**Удаление:** в меню `--uninstall` появляется пункт `subpage` — он гасит оба контейнера, удаляет `/opt/remnawave/{subscription,caddy}` и docker-volume `caddy-ssl-data`.
+```bash
+sudo bash server-bootstrap.sh \
+    --mode wg-relay \
+    --gate-address 1.2.3.4 \
+    --wg-port 51820 \
+    --wg-gate-port 51820 \
+    --with-subpage \
+    --subscription-domain sub.example.com \
+    --panel-url https://panel.example.com \
+    --api-token YOUR_TOKEN_HERE \
+    --non-interactive
+```
+
+**Удаление:** в меню `--uninstall` появляется пункт `subpage` — он гасит оба контейнера, удаляет `/opt/web/{subscription,caddy}` и docker-volume `caddy-ssl-data`.
 
 ### `custom` — Пошаговый выбор
 
@@ -748,8 +775,8 @@ sudo bash server-bootstrap.sh --mode node --non-interactive
 > # ⚠️ Test version of new Router mode (WL)
 > bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap-v-1-0-1.sh)
 >
-> # 🧪 Test build v1.1.0: relay + remnawave subscription-page on the same server
-> bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap-v-1-1-0.sh)
+> # 🧪 relay / wg-relay + subscription-page on the same server
+> bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh)
 >
 > # ✅ Correct — non-interactive works with both pipe and process substitution
 > bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh) --mode node --non-interactive
@@ -786,6 +813,11 @@ Flag                          Description
 --gate-address <ip>           Gate node IP address (required for relay / wg-relay mode)
 --wg-port <port>              wg-relay UDP listen port on this relay (default: 51820)
 --wg-gate-port <port>         wg-relay UDP WireGuard port on gate (default: 51820)
+--with-subpage                Install subscription-page with relay / wg-relay
+--subscription-domain <d>     Subscription page domain
+--panel-url <url>             Remnawave panel URL
+--api-token <token>           Panel API token
+--sub-prefix <prefix>         Optional CUSTOM_SUB_PREFIX
 --dry-run                     Simulation mode — no changes applied
 --verbose, -v                 Verbose/debug output
 --skip-selfsteal              Skip selfsteal installation
@@ -924,14 +956,14 @@ Everything from `base`, plus:
 | ✗ | remnanode — **not installed** |
 | ✗ | selfsteal — **not installed** |
 
-#### 🧪 v1.1.0 — relay + subscription-page on the same host (test build)
+#### 🧪 relay / wg-relay + subscription-page on the same host
 
-The test build `server-bootstrap-v-1-1-0.sh` adds an interactive question to relay mode: "Install subscription-page on this server?". When accepted, the script additionally installs:
+`relay` and `wg-relay` modes add an interactive question: "Install subscription-page on this server?". When accepted, the script additionally installs:
 
 - Docker + Docker Compose (if missing)
-- `remnawave/subscription-page:latest` at `/opt/remnawave/subscription` (binds `127.0.0.1:3010` only)
-- Caddy 2.9 at `/opt/remnawave/caddy` — issues a Let's Encrypt certificate and listens on `127.0.0.1:8443`
-- Opens `80/tcp` in UFW (for ACME HTTP-01)
+- `remnawave/subscription-page:latest` at `/opt/web/subscription` (binds `127.0.0.1:3010` only)
+- Caddy 2.9 at `/opt/web/caddy` — issues a Let's Encrypt certificate
+- Opens the required TCP ports in UFW
 
 **How relay and subpage share :443 — HAProxy SNI routing:**
 
@@ -943,9 +975,18 @@ Client → :443 (HAProxy, mode tcp)
 
 The subpage SNI rule is matched **before** the IP list checks, so subscription-page clients (including mobile operators) **bypass** `blocked.lst` / `allowed.lst`. The IP filter applies only to relay traffic.
 
+**How wg-relay + subpage works:**
+
+```text
+WireGuard: client -> BS:51820/udp -> IPVS+nft -> gate:51820/udp
+Subpage:   client -> BS:443/tcp   -> Caddy -> subscription-page:3010
+```
+
+`wg-relay` does not install HAProxy and only uses the WireGuard UDP port, so Caddy can listen on `80/tcp` and `443/tcp` directly.
+
 **Prerequisites:**
 
-1. **DNS A-record** `sub.example.com` → relay server IP
+1. **DNS A-record** `sub.example.com` → relay/wg-relay server IP
 2. **API token** in Remnawave panel: Settings → API Tokens
 3. **Panel URL** (e.g. `https://panel.example.com`)
 
@@ -959,13 +1000,13 @@ SUB_PUBLIC_DOMAIN=sub.example.com
 docker compose down remnawave && docker compose up -d
 ```
 
-**Certificate**: works fine. Relay HAProxy does NOT bind `:80`, so Caddy attaches to `0.0.0.0:80` directly and clears the ACME HTTP-01 challenge.
+**Certificate**: works fine. In `relay`, HAProxy does not bind `:80`, so Caddy clears ACME HTTP-01 through `80/tcp` and listens for TLS locally on `127.0.0.1:8443`. In `wg-relay`, Caddy listens on `80/tcp` and `443/tcp` directly.
 
-**CLI flags (v1.1.0):**
+**CLI flags:**
 
 | Flag | Description |
 |------|-------------|
-| `--with-subpage` | Co-install subscription-page with relay |
+| `--with-subpage` | Co-install subscription-page with `relay` or `wg-relay` |
 | `--subscription-domain <d>` | Page domain (e.g. `sub.example.com`) |
 | `--panel-url <url>` | Remnawave panel URL (`https://panel.example.com`) |
 | `--api-token <token>` | API token from the panel |
@@ -974,7 +1015,7 @@ docker compose down remnawave && docker compose up -d
 **Fully non-interactive example:**
 
 ```bash
-sudo bash server-bootstrap-v-1-1-0.sh \
+sudo bash server-bootstrap.sh \
     --mode relay \
     --gate-address 1.2.3.4 \
     --with-subpage \
@@ -984,7 +1025,20 @@ sudo bash server-bootstrap-v-1-1-0.sh \
     --non-interactive
 ```
 
-**Uninstall:** the `--uninstall` menu gains a `subpage` entry — it stops both containers, removes `/opt/remnawave/{subscription,caddy}` and the `caddy-ssl-data` docker volume.
+```bash
+sudo bash server-bootstrap.sh \
+    --mode wg-relay \
+    --gate-address 1.2.3.4 \
+    --wg-port 51820 \
+    --wg-gate-port 51820 \
+    --with-subpage \
+    --subscription-domain sub.example.com \
+    --panel-url https://panel.example.com \
+    --api-token YOUR_TOKEN_HERE \
+    --non-interactive
+```
+
+**Uninstall:** the `--uninstall` menu gains a `subpage` entry — it stops both containers, removes `/opt/web/{subscription,caddy}` and the `caddy-ssl-data` docker volume.
 
 ### `custom` — Step-by-step Selection
 
@@ -1353,4 +1407,4 @@ This mode does **not** install HAProxy, remnanode, selfsteal, or mobile443-filte
 
 ---
 
-*server-bootstrap.sh · v1.0.0 · Debian 12+ / Ubuntu 22.04+ · MIT License*
+*server-bootstrap.sh · v1.0.6 · Debian 12+ / Ubuntu 22.04+ · MIT License*
