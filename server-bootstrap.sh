@@ -2797,6 +2797,12 @@ ${BOLD}${CYAN}╔═════════════════════
     echo -e "  ${CYAN}Log file   :${RESET} ${LOG_FILE}"
     echo -e "  ${CYAN}Config file:${RESET} ${CONFIG_FILE}"
     echo -e "  ${CYAN}Backups    :${RESET} ${BACKUP_DIR}"
+    if [[ "${MODE:-}" == "xray-wg-relay" ]]; then
+        echo ""
+        echo -e "  ${CYAN}Remnawave host address:${RESET} ${RELAY_ADDRESS}:${XWG_RELAY_PORT}"
+        echo -e "  ${CYAN}Internal WG target   :${RESET} ${XWG_GATE_ADDRESS}:${XWG_GATE_PORT} via ${XWG_IFACE}"
+        echo -e "  ${YELLOW}Do not put ${XWG_GATE_ADDRESS} into the public host address.${RESET}"
+    fi
     if [[ "$DRY_RUN" == true ]]; then
         echo -e "
   ${MAGENTA}${BOLD}[DRY RUN] — No changes were made.${RESET}"
