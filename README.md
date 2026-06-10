@@ -12,6 +12,8 @@ Current relay split:
 
 `xray-wg-relay` does not run Xray on the BS and does not need Remnawave user sync on the BS. The subscription host should still use the gate/node Reality parameters, but the connection address should be the BS relay IP.
 
+Do not test `xray-wg-relay` with a client-side `wg-out` JSON template. That belongs to the old `wg-relay` experiment on UDP/51820. In `xray-wg-relay`, the client connects to the BS over ordinary Xray TCP/Reality, and the BS forwards that TCP stream to the gate over kernel WireGuard.
+
 Example:
 
 ```bash
@@ -24,7 +26,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/mai
   --xwg-address 10.66.66.2/32 \
   --xwg-gate-address 10.66.66.1 \
   --xwg-relay-port 443 \
-  --xwg-gate-port 443 \
+  --xwg-gate-port 9443 \
   --xwg-mtu 760 \
   --xwg-mss 720 \
   -y

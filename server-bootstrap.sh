@@ -54,7 +54,7 @@ XWG_ALLOWED_IPS="10.66.66.1/32"
 XWG_MTU="760"
 XWG_MSS="720"
 XWG_RELAY_PORT="443"        # client-facing TCP port on BS
-XWG_GATE_PORT="443"         # gate Xray TCP port over WireGuard
+XWG_GATE_PORT="9443"        # gate Xray TCP port over WireGuard
 XWG_KEEPALIVE="25"
 ALLOWED_LST_URL="https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/allowed.lst"  # Relay: URL to fetch allowed.lst; empty = use whois/RADB
 
@@ -3864,7 +3864,7 @@ ${BOLD}Options:${RESET}
   --xwg-mtu <n>          [xray-wg-relay] WireGuard MTU (default: 760)
   --xwg-mss <n>          [xray-wg-relay] TCP MSS clamp over WG (default: 720)
   --xwg-relay-port <p>   [xray-wg-relay] Public TCP port on BS (default: 443)
-  --xwg-gate-port <p>    [xray-wg-relay] Gate Xray TCP port over WG (default: 443)
+  --xwg-gate-port <p>    [xray-wg-relay] Gate Xray TCP port over WG (default: 9443)
   --xwg-iface <name>     [xray-wg-relay] WG interface name (default: wg-xray)
   --allowed-url <url>    URL to fetch allowed.lst (raw GitHub/CDN); empty = use whois/RADB
   --with-subpage         [relay|wg-relay] Co-install subscription page on this server
@@ -3902,7 +3902,7 @@ ${BOLD}Examples:${RESET}
        --xwg-endpoint 1.2.3.4:51820 --xwg-private-key <BS_WG_PRIVATE_KEY> \\
        --xwg-peer-public-key <GATE_WG_PUBLIC_KEY> \\
        --xwg-address 10.66.66.2/32 --xwg-gate-address 10.66.66.1 \\
-       --xwg-relay-port 443 --xwg-gate-port 443 --xwg-mtu 760 --xwg-mss 720 --non-interactive
+       --xwg-relay-port 443 --xwg-gate-port 9443 --xwg-mtu 760 --xwg-mss 720 --non-interactive
 
   # wg-relay + subscription-page on the same server
   bash ${SCRIPT_NAME} --mode wg-relay --relay-address 5.6.7.8 --gate-address 1.2.3.4 \\
