@@ -1,5 +1,35 @@
 # server-bootstrap.sh
 
+## Relay Modes
+
+Current relay split:
+
+| Mode | Status | Purpose |
+|---|---|---|
+| `relay` | stable | HAProxy TCP relay to a gate |
+| `wg-relay` | experimental | UDP WireGuard relay via nft DNAT+SNAT; kept as the old experimental path |
+| `xray-wg-relay` | new target | Client connects to BS TCP (`:443` by default), BS forwards Xray TCP to the gate WireGuard address via kernel WireGuard + nft DNAT/SNAT |
+
+`xray-wg-relay` does not run Xray on the BS and does not need Remnawave user sync on the BS. The subscription host should still use the gate/node Reality parameters, but the connection address should be the BS relay IP.
+
+Example:
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/server-bootstrap.sh) \
+  --mode xray-wg-relay \
+  --relay-address <BS_PUBLIC_IP> \
+  --xwg-endpoint <GATE_PUBLIC_IP>:51820 \
+  --xwg-private-key <BS_WG_PRIVATE_KEY> \
+  --xwg-peer-public-key <GATE_WG_PUBLIC_KEY> \
+  --xwg-address 10.66.66.2/32 \
+  --xwg-gate-address 10.66.66.1 \
+  --xwg-relay-port 443 \
+  --xwg-gate-port 443 \
+  --xwg-mtu 760 \
+  --xwg-mss 720 \
+  -y
+```
+
 > **[English version below ↓](#english)**
 
 ---

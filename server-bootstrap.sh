@@ -2,13 +2,13 @@
 # ==============================================================================
 #  server-bootstrap.sh — Production-ready server/node setup script
 #  Supports: Debian 12+ / Ubuntu 22.04+  |  Requires: root
-#  Modes: base | node | gate | relay | wg-relay | custom
+#  Modes: base | node | gate | relay | wg-relay | xray-wg-relay | custom
 #
 #  Usage (interactive):   bash server-bootstrap.sh
 #  Usage (non-interactive): bash server-bootstrap.sh --mode node [--options]
 #
 #  Author:  Kitsura VPN
-#  Version: 1.0.7
+#  Version: 1.0.8
 # ==============================================================================
 
 set -euo pipefail
@@ -19,7 +19,7 @@ IFS=$'
 # SECTION 1 · CONSTANTS & GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="1.0.7"
+readonly SCRIPT_VERSION="1.0.8"
 readonly SCRIPT_NAME="$(basename "$0")"
 LOG_FILE="/var/log/server-bootstrap.log"
 readonly CONFIG_FILE="/etc/server-bootstrap.conf"
@@ -36,7 +36,7 @@ SKIP_SELFSTEAL=false
 SKIP_UPDATE=false
 RESUME=false       # Resume interrupted install (skip already-OK steps)
 UNINSTALL=false    # Uninstall mode
-MODE=""         # base | node | gate | relay | wg-relay | custom
+MODE=""         # base | node | gate | relay | wg-relay | xray-wg-relay | custom
 GATE_ADDRESS="" # used in relay / wg-relay mode
 RELAY_ADDRESS=""  # Relay: this server's IP (auto-detected if empty)
 RELAY_PORT="443"  # Relay: port haproxy binds on
@@ -44,6 +44,18 @@ GATE_PORT="9443"  # Relay: port on gate (recommended: NOT 443)
 WG_RELAY_PORT="51820"      # wg-relay: UDP port exposed on this relay
 WG_GATE_PORT="51820"       # wg-relay: UDP port on gate WireGuard server
 WG_RELAY_SCHEDULER="rr"    # legacy option kept for old CLI calls; nft relay ignores it
+XWG_IFACE="wg-xray"         # xray-wg-relay: kernel WireGuard client interface on BS
+XWG_ENDPOINT=""             # xray-wg-relay: gate public WireGuard endpoint, e.g. 1.2.3.4:51820
+XWG_PRIVATE_KEY=""          # xray-wg-relay: BS WireGuard private key
+XWG_PEER_PUBLIC_KEY=""      # xray-wg-relay: gate WireGuard public key
+XWG_ADDRESS="10.66.66.2/32" # xray-wg-relay: BS WireGuard address
+XWG_GATE_ADDRESS="10.66.66.1" # xray-wg-relay: gate WireGuard address that receives Xray TCP
+XWG_ALLOWED_IPS="10.66.66.1/32"
+XWG_MTU="760"
+XWG_MSS="720"
+XWG_RELAY_PORT="443"        # client-facing TCP port on BS
+XWG_GATE_PORT="443"         # gate Xray TCP port over WireGuard
+XWG_KEEPALIVE="25"
 ALLOWED_LST_URL="https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/allowed.lst"  # Relay: URL to fetch allowed.lst; empty = use whois/RADB
 
 # Optional subscription-page co-install for relay / wg-relay modes.
@@ -85,6 +97,7 @@ declare -A CHANGELOG=(
     ["1.0.5"]="New wg-relay mode: UDP WireGuard relay over IPVS NAT with nftables SNAT, persistent systemd restore, dedicated forwarding sysctl, and UFW UDP rule."
     ["1.0.6"]="Optional subscription-page co-install for relay and wg-relay. relay uses HAProxy SNI split to local Caddy; wg-relay publishes Caddy directly on TCP :80/:443 while the UDP relay handles WireGuard."
     ["1.0.7"]="wg-relay now uses nftables DNAT+SNAT instead of IPVS. This preserves client-facing UDP/51820 on the BS relay while presenting the relay IP to the gate WireGuard server."
+    ["1.0.8"]="New xray-wg-relay mode: BS runs a kernel WireGuard client to the gate and relays client-facing Xray TCP through nft DNAT+SNAT to the gate's WireGuard address. Existing wg-relay is kept as experimental UDP relay."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -647,6 +660,34 @@ EOF
     STEP_STATUS["sysctl_wg_relay"]="OK"
 }
 
+apply_sysctl_xray_wg_relay() {
+    log_step "Applying xray-wg-relay sysctl settings"
+
+    local xwg_file="/etc/sysctl.d/99-xray-wg-relay.conf"
+    backup_file "$xwg_file"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would write xray-wg-relay sysctl to ${xwg_file}"
+        STEP_STATUS["sysctl_xray_wg_relay"]="DRY"
+        return 0
+    fi
+
+    local tmpfile
+    tmpfile="$(mktemp)"
+    cat > "$tmpfile" <<EOF
+# Managed by server-bootstrap.sh (xray-wg-relay mode) -- $(date)
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+EOF
+
+    mv "$tmpfile" "$xwg_file"
+    sysctl --system &>/dev/null || sysctl -p "$xwg_file" &>/dev/null || true
+    log_ok "xray-wg-relay sysctl applied (${xwg_file})"
+    STEP_STATUS["sysctl_xray_wg_relay"]="OK"
+}
+
 _get_ssh_port() {
     local sshd_cfg="/etc/ssh/sshd_config"
     local port=""
@@ -728,6 +769,11 @@ setup_ufw() {
                 ufw allow 443/tcp comment 'Subpage HTTPS' &>/dev/null
                 log_info "UFW: opened 80/tcp and 443/tcp for subpage"
             fi
+            ;;
+        xray-wg-relay)
+            ufw allow "${XWG_RELAY_PORT:-443}/tcp" comment 'Xray over WG relay' &>/dev/null
+            ufw default allow routed &>/dev/null || true
+            log_info "UFW: opened ${XWG_RELAY_PORT:-443}/tcp and allowed routed traffic"
             ;;
         monitoring)
             ufw allow 3000/tcp comment 'Grafana' &>/dev/null
@@ -874,6 +920,181 @@ EOF
     else
         log_error "nft relay table was not created as expected"
         STEP_STATUS["wg_relay_ipvs"]="FAILED"
+        return 1
+    fi
+}
+
+setup_xray_wg_client() {
+    log_step "Configuring WireGuard client for xray-wg-relay"
+
+    if [[ -z "$XWG_ENDPOINT" ]]; then
+        if [[ "$NON_INTERACTIVE" == true ]]; then
+            log_error "--xwg-endpoint is required in xray-wg-relay mode (gate public WG endpoint, e.g. 1.2.3.4:51820)"
+            STEP_STATUS["xray_wg_client"]="FAILED"
+            return 1
+        fi
+        read -rp "  Gate WireGuard endpoint [ip:port]: " XWG_ENDPOINT
+    fi
+    if [[ -z "$XWG_PRIVATE_KEY" ]]; then
+        if [[ "$NON_INTERACTIVE" == true ]]; then
+            log_error "--xwg-private-key is required in xray-wg-relay mode"
+            STEP_STATUS["xray_wg_client"]="FAILED"
+            return 1
+        fi
+        read -rsp "  BS WireGuard private key: " XWG_PRIVATE_KEY
+        echo ""
+    fi
+    if [[ -z "$XWG_PEER_PUBLIC_KEY" ]]; then
+        if [[ "$NON_INTERACTIVE" == true ]]; then
+            log_error "--xwg-peer-public-key is required in xray-wg-relay mode"
+            STEP_STATUS["xray_wg_client"]="FAILED"
+            return 1
+        fi
+        read -rp "  Gate WireGuard public key: " XWG_PEER_PUBLIC_KEY
+    fi
+
+    if ! [[ "$XWG_RELAY_PORT" =~ ^[0-9]+$ && "$XWG_GATE_PORT" =~ ^[0-9]+$ && "$XWG_MTU" =~ ^[0-9]+$ && "$XWG_MSS" =~ ^[0-9]+$ ]]; then
+        log_error "xray-wg-relay ports/MTU/MSS must be numeric (relay=${XWG_RELAY_PORT}, gate=${XWG_GATE_PORT}, mtu=${XWG_MTU}, mss=${XWG_MSS})"
+        STEP_STATUS["xray_wg_client"]="FAILED"
+        return 1
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would configure /etc/wireguard/${XWG_IFACE}.conf and enable wg-quick@${XWG_IFACE}"
+        STEP_STATUS["xray_wg_client"]="DRY"
+        return 0
+    fi
+
+    install_packages wireguard-tools
+
+    mkdir -p /etc/wireguard
+    chmod 700 /etc/wireguard
+
+    local conf="/etc/wireguard/${XWG_IFACE}.conf"
+    backup_file "$conf"
+    cat > "$conf" <<EOF
+[Interface]
+PrivateKey = ${XWG_PRIVATE_KEY}
+Address = ${XWG_ADDRESS}
+MTU = ${XWG_MTU}
+
+[Peer]
+PublicKey = ${XWG_PEER_PUBLIC_KEY}
+Endpoint = ${XWG_ENDPOINT}
+AllowedIPs = ${XWG_ALLOWED_IPS}
+PersistentKeepalive = ${XWG_KEEPALIVE}
+EOF
+    chmod 600 "$conf"
+
+    systemctl enable --now "wg-quick@${XWG_IFACE}" >/dev/null
+    if wg show "$XWG_IFACE" >/dev/null 2>&1; then
+        log_ok "WireGuard client up: ${XWG_IFACE} ${XWG_ADDRESS} -> ${XWG_ENDPOINT}"
+        STEP_STATUS["xray_wg_client"]="OK"
+    else
+        log_error "WireGuard interface ${XWG_IFACE} did not start"
+        STEP_STATUS["xray_wg_client"]="FAILED"
+        return 1
+    fi
+}
+
+setup_xray_wg_relay_nft() {
+    log_step "Configuring Xray TCP relay over WireGuard via nftables"
+
+    if [[ -z "${RELAY_ADDRESS:-}" ]]; then
+        RELAY_ADDRESS="$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo '')"
+        [[ -n "$RELAY_ADDRESS" ]] && log_info "Auto-detected RELAY_ADDRESS: ${RELAY_ADDRESS}"
+    fi
+    if [[ -z "${RELAY_ADDRESS:-}" ]]; then
+        if [[ "$NON_INTERACTIVE" == true ]]; then
+            log_error "--relay-address is required when auto-detection fails in xray-wg-relay mode"
+            STEP_STATUS["xray_wg_relay"]="FAILED"
+            return 1
+        fi
+        read -rp "  Enter RELAY (this server) public IP: " RELAY_ADDRESS
+    fi
+    _validate_ip "$RELAY_ADDRESS" || {
+        log_error "Invalid RELAY_ADDRESS: ${RELAY_ADDRESS}"
+        STEP_STATUS["xray_wg_relay"]="FAILED"
+        return 1
+    }
+
+    local xwg_source_ip="${XWG_ADDRESS%%/*}"
+    log_info "Xray WG relay: ${RELAY_ADDRESS}:${XWG_RELAY_PORT}/tcp -> ${XWG_GATE_ADDRESS}:${XWG_GATE_PORT}/tcp via ${XWG_IFACE}"
+    log_info "NAT: DNAT client->gate WG address, SNAT gate-facing source to ${xwg_source_ip}"
+    log_info "TCP MSS clamp over ${XWG_IFACE}: ${XWG_MSS}"
+    log_warn "Gate must listen on ${XWG_GATE_ADDRESS}:${XWG_GATE_PORT}/tcp and allow traffic from ${xwg_source_ip}"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would configure nftables TCP DNAT+SNAT relay"
+        STEP_STATUS["xray_wg_relay"]="DRY"
+        return 0
+    fi
+
+    install_packages nftables
+
+    mkdir -p /etc/nftables.d
+    cat > /etc/nftables.d/server-bootstrap-xray-wg-relay.nft <<EOF
+table ip server_bootstrap_xray_wg_relay {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip daddr ${RELAY_ADDRESS} tcp dport ${XWG_RELAY_PORT} dnat to ${XWG_GATE_ADDRESS}:${XWG_GATE_PORT}
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "${XWG_IFACE}" ip daddr ${XWG_GATE_ADDRESS} tcp dport ${XWG_GATE_PORT} snat to ${xwg_source_ip}
+    }
+
+    chain forward_mss {
+        type filter hook forward priority mangle; policy accept;
+        oifname "${XWG_IFACE}" tcp flags syn tcp option maxseg size set ${XWG_MSS}
+        iifname "${XWG_IFACE}" tcp flags syn tcp option maxseg size set ${XWG_MSS}
+    }
+}
+EOF
+
+    cat > /usr/local/sbin/server-bootstrap-xray-wg-relay-apply <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+for mod in nf_conntrack nf_nat; do
+    modprobe "\$mod" 2>/dev/null || true
+done
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null || true
+
+nft delete table ip server_bootstrap_xray_wg_relay 2>/dev/null || true
+nft -f /etc/nftables.d/server-bootstrap-xray-wg-relay.nft
+EOF
+    chmod 0755 /usr/local/sbin/server-bootstrap-xray-wg-relay-apply
+
+    cat > /etc/systemd/system/server-bootstrap-xray-wg-relay.service <<EOF
+[Unit]
+Description=server-bootstrap Xray TCP over WireGuard relay
+Wants=network-online.target wg-quick@${XWG_IFACE}.service
+After=network-online.target wg-quick@${XWG_IFACE}.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/server-bootstrap-xray-wg-relay-apply
+ExecStop=/bin/bash -c 'nft delete table ip server_bootstrap_xray_wg_relay 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now server-bootstrap-xray-wg-relay.service >/dev/null
+
+    if nft list table ip server_bootstrap_xray_wg_relay 2>/dev/null | grep -q "dnat to ${XWG_GATE_ADDRESS}:${XWG_GATE_PORT}"; then
+        log_ok "xray-wg-relay active: ${RELAY_ADDRESS}:${XWG_RELAY_PORT}/tcp -> ${XWG_GATE_ADDRESS}:${XWG_GATE_PORT}/tcp"
+        STEP_STATUS["xray_wg_relay"]="OK"
+    else
+        log_error "xray-wg-relay nft table was not created as expected"
+        STEP_STATUS["xray_wg_relay"]="FAILED"
         return 1
     fi
 }
@@ -2595,9 +2816,22 @@ RELAY_ADDRESS="${RELAY_ADDRESS:-}"
 WG_RELAY_PORT="${WG_RELAY_PORT:-}"
 WG_GATE_PORT="${WG_GATE_PORT:-}"
 WG_RELAY_SCHEDULER="${WG_RELAY_SCHEDULER:-}"
+XWG_IFACE="${XWG_IFACE:-}"
+XWG_ENDPOINT="${XWG_ENDPOINT:-}"
+XWG_PRIVATE_KEY="${XWG_PRIVATE_KEY:-}"
+XWG_PEER_PUBLIC_KEY="${XWG_PEER_PUBLIC_KEY:-}"
+XWG_ADDRESS="${XWG_ADDRESS:-}"
+XWG_GATE_ADDRESS="${XWG_GATE_ADDRESS:-}"
+XWG_ALLOWED_IPS="${XWG_ALLOWED_IPS:-}"
+XWG_MTU="${XWG_MTU:-}"
+XWG_MSS="${XWG_MSS:-}"
+XWG_RELAY_PORT="${XWG_RELAY_PORT:-}"
+XWG_GATE_PORT="${XWG_GATE_PORT:-}"
+XWG_KEEPALIVE="${XWG_KEEPALIVE:-}"
 IS_CONTAINER="${IS_CONTAINER:-false}"
 OS_PRETTY="${OS_PRETTY:-}"
 EOF
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
     log_debug "Config saved to ${CONFIG_FILE}"
 }
 
@@ -2916,6 +3150,28 @@ run_soft_update() {
         fi
     fi
 
+    if [[ "${_STATE[xray_wg_client]:-}" == "OK" ]]; then
+        log_step "Updating: xray-wg-relay WireGuard client"
+        state_save_step "xray_wg_client" "UPDATING"
+        if setup_xray_wg_client; then
+            state_save_step "xray_wg_client" "OK"
+            log_ok "xray-wg-relay WireGuard client updated"
+        else
+            state_save_step "xray_wg_client" "FAILED"
+        fi
+    fi
+
+    if [[ "${_STATE[xray_wg_relay]:-}" == "OK" ]]; then
+        log_step "Updating: xray-wg-relay nft relay"
+        state_save_step "xray_wg_relay" "UPDATING"
+        if setup_xray_wg_relay_nft; then
+            state_save_step "xray_wg_relay" "OK"
+            log_ok "xray-wg-relay nft relay updated"
+        else
+            state_save_step "xray_wg_relay" "FAILED"
+        fi
+    fi
+
     # Bump version in state after soft update
     state_save_step "_version_updated" "OK"
     log_ok "Soft update complete — v${_STATE_VERSION} → v${SCRIPT_VERSION}"
@@ -2992,6 +3248,32 @@ uninstall_wg_relay() {
     state_save_step "wg_relay_ipvs" "REMOVED"
     state_save_step "sysctl_wg_relay" "REMOVED"
     log_ok "wg-relay removed"
+}
+
+uninstall_xray_wg_relay() {
+    log_step "Uninstalling xray-wg-relay"
+    [[ "$DRY_RUN" == true ]] && { log_dry "Would remove xray-wg-relay nft/systemd/WireGuard client config"; return 0; }
+
+    systemctl stop server-bootstrap-xray-wg-relay 2>/dev/null || true
+    systemctl disable server-bootstrap-xray-wg-relay 2>/dev/null || true
+    if [[ -n "${XWG_IFACE:-}" ]]; then
+        systemctl stop "wg-quick@${XWG_IFACE}" 2>/dev/null || true
+        systemctl disable "wg-quick@${XWG_IFACE}" 2>/dev/null || true
+        rm -f "/etc/wireguard/${XWG_IFACE}.conf"
+    fi
+    nft delete table ip server_bootstrap_xray_wg_relay 2>/dev/null || true
+
+    rm -f /etc/systemd/system/server-bootstrap-xray-wg-relay.service
+    rm -f /usr/local/sbin/server-bootstrap-xray-wg-relay-apply
+    rm -f /etc/nftables.d/server-bootstrap-xray-wg-relay.nft
+    rm -f /etc/sysctl.d/99-xray-wg-relay.conf
+    systemctl daemon-reload 2>/dev/null || true
+    sysctl --system &>/dev/null || true
+
+    state_save_step "xray_wg_client" "REMOVED"
+    state_save_step "xray_wg_relay" "REMOVED"
+    state_save_step "sysctl_xray_wg_relay" "REMOVED"
+    log_ok "xray-wg-relay removed"
 }
 
 uninstall_subpage() {
@@ -3102,7 +3384,7 @@ uninstall_sysctl() {
     log_step "Reverting sysctl settings"
     [[ "$DRY_RUN" == true ]] && { log_dry "Would remove ${SYSCTL_FILE} and reload sysctl"; return 0; }
 
-    rm -f "$SYSCTL_FILE" /etc/sysctl.d/99-wg-relay.conf
+    rm -f "$SYSCTL_FILE" /etc/sysctl.d/99-wg-relay.conf /etc/sysctl.d/99-xray-wg-relay.conf
     sysctl --system &>/dev/null || true
 
     state_save_step "sysctl_network" "REMOVED"
@@ -3126,7 +3408,7 @@ run_uninstall() {
     local components=()
     local labels=()
 
-    for step in haproxy haproxy_gate wg_relay_ipvs subpage monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network; do
+    for step in haproxy haproxy_gate wg_relay_ipvs xray_wg_client xray_wg_relay subpage monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network; do
         local st="${_STATE[$step]:-unknown}"
         if [[ "$st" == "OK" || "$st" == "SKIPPED(resume)" ]]; then
             components+=("$step")
@@ -3142,7 +3424,7 @@ run_uninstall() {
     if [[ ${#components[@]} -eq 0 ]]; then
         log_warn "No installed components found in state file"
         log_info "You can still uninstall manually by selecting components below"
-        components=(haproxy haproxy_gate wg_relay_ipvs subpage monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network)
+        components=(haproxy haproxy_gate wg_relay_ipvs xray_wg_client xray_wg_relay subpage monitoring fail2ban ufw remnanode selfsteal mobile443 docker sysctl_network)
         for c in "${components[@]}"; do labels+=("$c"); done
     fi
 
@@ -3172,6 +3454,7 @@ run_uninstall() {
             uninstall_monitoring
             uninstall_haproxy
             uninstall_wg_relay
+            uninstall_xray_wg_relay
             uninstall_subpage
             uninstall_remnanode
             uninstall_selfsteal
@@ -3191,6 +3474,7 @@ run_uninstall() {
                     haproxy)       uninstall_haproxy    ;;
                     haproxy_gate)  uninstall_haproxy    ;;
                     wg_relay_ipvs) uninstall_wg_relay   ;;
+                    xray_wg_client|xray_wg_relay) uninstall_xray_wg_relay ;;
                     subpage)       uninstall_subpage    ;;
                     monitoring)    uninstall_monitoring ;;
                     fail2ban)      uninstall_fail2ban   ;;
@@ -3199,7 +3483,7 @@ run_uninstall() {
                     selfsteal)     uninstall_selfsteal  ;;
                     mobile443)     uninstall_mobile443  ;;
                     docker)        uninstall_docker     ;;
-                    sysctl_network|sysctl_router|sysctl_wg_relay) uninstall_sysctl ;;
+                    sysctl_network|sysctl_router|sysctl_wg_relay|sysctl_xray_wg_relay) uninstall_sysctl ;;
                     *) log_error "Unknown component: ${target}" ;;
                 esac
             else
@@ -3326,6 +3610,27 @@ run_wg_relay() {
     STEP_STATUS["mode"]="wg-relay/OK"
 }
 
+run_xray_wg_relay() {
+    log_step "Mode: xray-wg-relay"
+    log_info "BS accepts client Xray TCP on ${XWG_RELAY_PORT}/tcp and forwards it to ${XWG_GATE_ADDRESS}:${XWG_GATE_PORT} through ${XWG_IFACE}"
+    log_warn "This mode does not run Xray on BS and does not sync Remnawave users."
+    log_warn "Client subscriptions must still use the gate/node Reality public key/SNI, but address must be the BS relay IP."
+
+    apt_update
+    run_step "base_packages"      setup_base_packages
+    run_step "timezone"           setup_timezone
+    run_step "sysctl_network"     apply_sysctl_network
+    run_step "sysctl_xray_wg_relay" apply_sysctl_xray_wg_relay
+    run_step "swap"               setup_swap
+    run_step "ssh"                setup_ssh
+    run_step "ufw"                setup_ufw "xray-wg-relay"
+    run_step "fail2ban"           setup_fail2ban
+    run_step "xray_wg_client"     setup_xray_wg_client
+    run_step "xray_wg_relay"      setup_xray_wg_relay_nft
+
+    STEP_STATUS["mode"]="xray-wg-relay/OK"
+}
+
 run_custom() {
     log_step "MODE: CUSTOM (step-by-step)"
 
@@ -3380,7 +3685,9 @@ show_menu_legacy() {
         echo -e "  ${CYAN}2)${RESET} node    — Regular node (base + remnanode + selfsteal)"
         echo -e "  ${CYAN}3)${RESET} gate    — Gate node (base + remnanode + selfsteal + block-only filter)"
         echo -e "  ${CYAN}4)${RESET} relay   — Relay/Node Relay mode (base + haproxy + mobile443 filter)"
-        echo -e "  ${CYAN}5)${RESET} custom  — Step-by-step component selection"
+        echo -e "  ${CYAN}5)${RESET} wg-relay — Experimental WireGuard UDP relay via nft DNAT+SNAT"
+        echo -e "  ${CYAN}6)${RESET} xray-wg-relay — Xray TCP relay through kernel WireGuard"
+        echo -e "  ${CYAN}7)${RESET} custom  — Step-by-step component selection"
         echo ""
         echo -e "  ${YELLOW}r)${RESET} Resume  — Continue interrupted installation"
         echo -e "  ${YELLOW}s)${RESET} Status  — Show current system status"
@@ -3398,7 +3705,8 @@ show_menu_legacy() {
             3) MODE="gate";   show_summary_confirm && run_gate   ;;
             4) MODE="relay";  show_summary_confirm && run_relay  ;;
             5) MODE="wg-relay"; show_summary_confirm && run_wg_relay ;;
-            6) MODE="custom"; run_custom ;;
+            6) MODE="xray-wg-relay"; show_summary_confirm && run_xray_wg_relay ;;
+            7) MODE="custom"; run_custom ;;
             r|R)
                 if [[ -z "${_STATE_MODE:-}" ]]; then
                     log_warn "No previous installation state found"
@@ -3412,6 +3720,7 @@ show_menu_legacy() {
                         gate)  run_gate  ;;
                         relay) run_relay ;;
                         wg-relay) run_wg_relay ;;
+                        xray-wg-relay) run_xray_wg_relay ;;
                         *)     log_error "Cannot resume unknown mode: ${MODE}" ;;
                     esac
                 fi
@@ -3457,7 +3766,8 @@ show_menu() {
         echo -e "  ${CYAN}3)${RESET} gate     - Gate node (base + remnanode + selfsteal + block-only filter)"
         echo -e "  ${CYAN}4)${RESET} relay    - HAProxy Relay/Node Relay mode"
         echo -e "  ${CYAN}5)${RESET} wg-relay - WireGuard UDP relay via nft DNAT+SNAT"
-        echo -e "  ${CYAN}6)${RESET} custom   - Step-by-step component selection"
+        echo -e "  ${CYAN}6)${RESET} xray-wg-relay - Xray TCP relay through kernel WireGuard"
+        echo -e "  ${CYAN}7)${RESET} custom   - Step-by-step component selection"
         echo ""
         echo -e "  ${YELLOW}r)${RESET} Resume"
         echo -e "  ${YELLOW}s)${RESET} Status"
@@ -3475,7 +3785,8 @@ show_menu() {
             3) MODE="gate";     show_summary_confirm && run_gate ;;
             4) MODE="relay";    show_summary_confirm && run_relay ;;
             5) MODE="wg-relay"; show_summary_confirm && run_wg_relay ;;
-            6) MODE="custom";   run_custom ;;
+            6) MODE="xray-wg-relay"; show_summary_confirm && run_xray_wg_relay ;;
+            7) MODE="custom";   run_custom ;;
             r|R)
                 if [[ -z "${_STATE_MODE:-}" ]]; then
                     log_warn "No previous installation state found"
@@ -3489,6 +3800,7 @@ show_menu() {
                         gate)     run_gate ;;
                         relay)    run_relay ;;
                         wg-relay) run_wg_relay ;;
+                        xray-wg-relay) run_xray_wg_relay ;;
                         *)        log_error "Cannot resume unknown mode: ${MODE}" ;;
                     esac
                 fi
@@ -3535,11 +3847,25 @@ ${BOLD}Usage:${RESET}
   ${SCRIPT_NAME} [OPTIONS]
 
 ${BOLD}Options:${RESET}
-  --mode <mode>          Run mode: base | node | gate | relay | wg-relay | custom
+  --mode <mode>          Run mode: base | node | gate | relay | wg-relay | xray-wg-relay | custom
   --gate-address <ip>    Gate IP address (required for relay / wg-relay mode)
   --relay-address <ip>   Relay public IP for wg-relay nft DNAT/SNAT (auto-detected if empty)
   --wg-port <port>       wg-relay UDP listen port on this relay (default: 51820)
   --wg-gate-port <port>  wg-relay UDP WireGuard port on gate (default: 51820)
+  --xwg-endpoint <ip:p>  [xray-wg-relay] Gate public WireGuard endpoint
+  --xwg-private-key <k>  [xray-wg-relay] BS WireGuard private key
+  --xwg-peer-public-key <k>
+                         [xray-wg-relay] Gate WireGuard public key
+  --xwg-address <cidr>   [xray-wg-relay] BS WG address (default: 10.66.66.2/32)
+  --xwg-gate-address <ip>
+                         [xray-wg-relay] Gate WG address (default: 10.66.66.1)
+  --xwg-allowed-ips <cidr>
+                         [xray-wg-relay] WG peer AllowedIPs (default: 10.66.66.1/32)
+  --xwg-mtu <n>          [xray-wg-relay] WireGuard MTU (default: 760)
+  --xwg-mss <n>          [xray-wg-relay] TCP MSS clamp over WG (default: 720)
+  --xwg-relay-port <p>   [xray-wg-relay] Public TCP port on BS (default: 443)
+  --xwg-gate-port <p>    [xray-wg-relay] Gate Xray TCP port over WG (default: 443)
+  --xwg-iface <name>     [xray-wg-relay] WG interface name (default: wg-xray)
   --allowed-url <url>    URL to fetch allowed.lst (raw GitHub/CDN); empty = use whois/RADB
   --with-subpage         [relay|wg-relay] Co-install subscription page on this server
   --subscription-domain <d>
@@ -3570,6 +3896,13 @@ ${BOLD}Examples:${RESET}
 
   # WireGuard UDP relay via nft DNAT+SNAT
   bash ${SCRIPT_NAME} --mode wg-relay --relay-address 5.6.7.8 --gate-address 1.2.3.4 --wg-port 51820 --wg-gate-port 51820 --non-interactive
+
+  # Xray TCP over kernel WireGuard relay
+  bash ${SCRIPT_NAME} --mode xray-wg-relay --relay-address 5.6.7.8 \\
+       --xwg-endpoint 1.2.3.4:51820 --xwg-private-key <BS_WG_PRIVATE_KEY> \\
+       --xwg-peer-public-key <GATE_WG_PUBLIC_KEY> \\
+       --xwg-address 10.66.66.2/32 --xwg-gate-address 10.66.66.1 \\
+       --xwg-relay-port 443 --xwg-gate-port 443 --xwg-mtu 760 --xwg-mss 720 --non-interactive
 
   # wg-relay + subscription-page on the same server
   bash ${SCRIPT_NAME} --mode wg-relay --relay-address 5.6.7.8 --gate-address 1.2.3.4 \\
@@ -3607,6 +3940,18 @@ parse_args() {
             --wg-port)         WG_RELAY_PORT="$2"; shift 2 ;;
             --wg-gate-port)    WG_GATE_PORT="$2";  shift 2 ;;
             --wg-scheduler)    WG_RELAY_SCHEDULER="$2"; shift 2 ;;
+            --xwg-endpoint)    XWG_ENDPOINT="$2"; shift 2 ;;
+            --xwg-private-key) XWG_PRIVATE_KEY="$2"; shift 2 ;;
+            --xwg-peer-public-key) XWG_PEER_PUBLIC_KEY="$2"; shift 2 ;;
+            --xwg-address)     XWG_ADDRESS="$2"; shift 2 ;;
+            --xwg-gate-address) XWG_GATE_ADDRESS="$2"; shift 2 ;;
+            --xwg-allowed-ips) XWG_ALLOWED_IPS="$2"; shift 2 ;;
+            --xwg-mtu)         XWG_MTU="$2"; shift 2 ;;
+            --xwg-mss)         XWG_MSS="$2"; shift 2 ;;
+            --xwg-relay-port)  XWG_RELAY_PORT="$2"; shift 2 ;;
+            --xwg-gate-port)   XWG_GATE_PORT="$2"; shift 2 ;;
+            --xwg-iface)       XWG_IFACE="$2"; shift 2 ;;
+            --xwg-keepalive)   XWG_KEEPALIVE="$2"; shift 2 ;;
             --with-subpage)         WITH_SUBPAGE=true;            shift   ;;
             --subscription-domain)  SUBSCRIPTION_DOMAIN="$2";     shift 2 ;;
             --panel-url)            PANEL_URL="$2";               shift 2 ;;
@@ -3614,6 +3959,7 @@ parse_args() {
             --sub-prefix)           CUSTOM_SUB_PREFIX="$2";       shift 2 ;;
             --resume)          RESUME=true;          shift   ;;
             --uninstall)       UNINSTALL=true;        shift   ;;
+            --dry-run)         DRY_RUN=true;          shift   ;;
             --verbose|-v)      VERBOSE=true;         shift   ;;
             --skip-selfsteal)  SKIP_SELFSTEAL=true;  shift   ;;
             --skip-update)     SKIP_UPDATE=true;     shift   ;;
@@ -3645,6 +3991,13 @@ parse_args() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 main() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # Load saved non-mode defaults (keys, WG params, relay addresses). MODE is
+        # intentionally not restored from BOOTSTRAP_MODE here; interactive runs
+        # should still show the menu unless --mode is passed or --resume is used.
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE" || true
+    fi
     parse_args "$@"
     print_header
     _log_session_header
@@ -3738,9 +4091,10 @@ main() {
             gate)   run_gate    ;;
             relay)  run_relay   ;;
             wg-relay) run_wg_relay ;;
+            xray-wg-relay) run_xray_wg_relay ;;
             custom) run_custom  ;;
             *)
-                log_error "Unknown mode: '${MODE}'. Valid: base | node | gate | relay | wg-relay | custom"
+                log_error "Unknown mode: '${MODE}'. Valid: base | node | gate | relay | wg-relay | xray-wg-relay | custom"
                 exit 1
                 ;;
         esac
@@ -3758,6 +4112,7 @@ main() {
             gate)   show_summary_confirm && run_gate    ;;
             relay)  show_summary_confirm && run_relay   ;;
             wg-relay) show_summary_confirm && run_wg_relay ;;
+            xray-wg-relay) show_summary_confirm && run_xray_wg_relay ;;
             custom) run_custom ;;
             *)
                 log_error "Unknown mode: '${MODE}'"
