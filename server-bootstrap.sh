@@ -971,6 +971,7 @@ setup_xray_wg_client() {
     chmod 700 /etc/wireguard
 
     local conf="/etc/wireguard/${XWG_IFACE}.conf"
+    systemctl stop "wg-quick@${XWG_IFACE}" 2>/dev/null || true
     backup_file "$conf"
     cat > "$conf" <<EOF
 [Interface]
