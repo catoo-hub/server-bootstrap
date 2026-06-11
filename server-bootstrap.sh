@@ -1380,7 +1380,7 @@ _ask_subpage_params() {
         read -rp "  Custom subscription path prefix (empty = none): " CUSTOM_SUB_PREFIX
     fi
 
-    if [[ "${MODE:-}" == "wg-relay" ]]; then
+    if [[ "${MODE:-}" == "wg-relay" || "${MODE:-}" == "xray-wg-relay" ]]; then
         log_info "SUBPAGE: ${SUBSCRIPTION_DOMAIN} → public Caddy :443 → :${SUBPAGE_APP_PORT}"
     else
         log_info "SUBPAGE: ${SUBSCRIPTION_DOMAIN} → 127.0.0.1:${SUBPAGE_LOCAL_TLS_PORT} (HAProxy SNI → Caddy → :${SUBPAGE_APP_PORT})"
@@ -2210,7 +2210,7 @@ EOF
     log_info "Wrote ${SUBPAGE_DIR}/.env (mode 600)"
 
     local caddy_global caddy_ports verify_hint
-    if [[ "${MODE:-}" == "wg-relay" ]]; then
+    if [[ "${MODE:-}" == "wg-relay" || "${MODE:-}" == "xray-wg-relay" ]]; then
         caddy_global="{
     http_port 80
     https_port 443
