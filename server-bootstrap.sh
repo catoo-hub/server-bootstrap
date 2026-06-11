@@ -8,7 +8,7 @@
 #  Usage (non-interactive): bash server-bootstrap.sh --mode node [--options]
 #
 #  Author:  Kitsura VPN
-#  Version: 1.0.4
+#  Version: 1.0.5
 # ==============================================================================
 
 set -euo pipefail
@@ -19,7 +19,7 @@ IFS=$'
 # SECTION 1 · CONSTANTS & GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="1.0.4"
+readonly SCRIPT_VERSION="1.0.5"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/server-bootstrap.log"
 readonly CONFIG_FILE="/etc/server-bootstrap.conf"
@@ -36,11 +36,18 @@ SKIP_SELFSTEAL=false
 SKIP_UPDATE=false
 RESUME=false       # Resume interrupted install (skip already-OK steps)
 UNINSTALL=false    # Uninstall mode
+RELAY_DOCTOR=false # Run relay diagnostics and exit
 MODE=""         # base | node | gate | relay | custom
 GATE_ADDRESS="" # used in relay mode
 RELAY_ADDRESS=""  # Relay: this server's IP (auto-detected if empty)
 RELAY_PORT="443"  # Relay: port haproxy binds on
 GATE_PORT="9443"  # Relay: port on gate (recommended: NOT 443)
+RELAY_TRANSPORT="tcp" # Relay transport: tcp | xhttp3
+RELAY_FILTER_MODE="block-only" # tcp relay filter: strict | block-only | observe
+RELAY_DOMAIN="" # xhttp3: public domain pointing to this relay
+GATE_SCHEME="http" # xhttp3: upstream scheme to gate: http | https
+GATE_PATH="/xhttp/*" # xhttp3: reverse_proxy path matcher
+FALLBACK_SITE_DIR="/var/www/relay-site" # xhttp3: static fallback site
 ALLOWED_LST_URL="https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/allowed.lst"  # Relay: URL to fetch allowed.lst; empty = use whois/RADB
 
 # ── Auto-detect pipe mode (curl URL | bash kills stdin) ───────────────────────
@@ -62,6 +69,7 @@ declare -A CHANGELOG=(
     ["1.0.2"]="allowed.lst: URL fetch mode (GitHub raw) with If-Modified-Since, cron 3x daily + 10/16/22h refresh. State engine: resume interrupted installs, per-step tracking. Uninstall menu per component."
     ["1.0.3"]="Version tracking in logs (session header). Changelog display on upgrade. Soft-update mode: backup configs before re-running changed components, merge/restore on failure."
     ["1.0.4"]="HAProxy relay: silent-drop backends (no blackhole server), daemon+nbthread+tunnel timeout, stats HTTP page :8404, systemd Restart=always drop-in, graceful reload. Gate mode: HAProxy-native blocking replaces mobile443-filter (blocked.lst+allowed.lst on gate). Monitoring: Prometheus+Grafana Docker Compose stack with HAProxy+Node Exporter dashboards, provisioned at /opt/monitoring."
+    ["1.0.5"]="Relay stability: TCP keepalive sysctl + tcp_mtu_probing, HAProxy tcpka, block-only filter default, xhttp3 relay transport via Caddy HTTP/3 reverse proxy, relay-doctor diagnostics."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -340,7 +348,7 @@ BASE_PACKAGES=(
     curl wget git unzip tar jq
     vim nano htop net-tools dnsutils
     iproute2 ufw fail2ban socat
-    tcpdump mtr ca-certificates
+    tcpdump mtr netcat-openbsd ca-certificates
     lsb-release gnupg2 software-properties-common
     bc psmisc procps
 )
@@ -538,6 +546,10 @@ EOF
         ["net.ipv4.tcp_window_scaling"]="1"
         ["net.ipv4.tcp_sack"]="1"
         ["net.ipv4.tcp_timestamps"]="1"
+        ["net.ipv4.tcp_mtu_probing"]="1"
+        ["net.ipv4.tcp_keepalive_time"]="60"
+        ["net.ipv4.tcp_keepalive_intvl"]="10"
+        ["net.ipv4.tcp_keepalive_probes"]="6"
         ["net.core.default_qdisc"]="fq"
         ["net.ipv4.tcp_congestion_control"]="bbr"
     )
@@ -665,6 +677,9 @@ setup_ufw() {
             ;;
         relay)
             ufw allow "${RELAY_PORT:-443}/tcp" comment 'HAProxy relay' &>/dev/null
+            if [[ "${RELAY_TRANSPORT:-tcp}" == "xhttp3" ]]; then
+                ufw allow "${RELAY_PORT:-443}/udp" comment 'HTTP/3 relay' &>/dev/null
+            fi
             ;;
         monitoring)
             ufw allow 3000/tcp comment 'Grafana' &>/dev/null
@@ -924,8 +939,19 @@ _ask_relay_params() {
     fi
     _validate_port "$GATE_PORT" || { log_error "Invalid GATE_PORT: ${GATE_PORT}"; exit 1; }
 
+    case "$RELAY_TRANSPORT" in
+        tcp|xhttp3) ;;
+        *) log_error "Invalid RELAY_TRANSPORT: ${RELAY_TRANSPORT}. Valid: tcp | xhttp3"; exit 1 ;;
+    esac
+
+    case "$RELAY_FILTER_MODE" in
+        strict|block-only|observe) ;;
+        *) log_error "Invalid RELAY_FILTER_MODE: ${RELAY_FILTER_MODE}. Valid: strict | block-only | observe"; exit 1 ;;
+    esac
+
     log_info "RELAY  : ${RELAY_ADDRESS}:${RELAY_PORT}"
     log_info "GATE   : ${GATE_ADDRESS}:${GATE_PORT}"
+    log_info "Transport: ${RELAY_TRANSPORT}"
 }
 
 # ── Write HAProxy config (relay mode) ────────────────────────────────────────
@@ -936,6 +962,22 @@ _write_haproxy_cfg() {
     # Ensure list files and socket dir exist before writing config
     mkdir -p /var/run/haproxy
     touch /etc/haproxy/blocked.lst /etc/haproxy/allowed.lst
+
+    local filter_rules
+    case "$RELAY_FILTER_MODE" in
+        strict)
+            filter_rules="    # strict: block known bad networks and drop clients outside allowed.lst
+    use_backend bk_blocked if { src -f /etc/haproxy/blocked.lst }
+    use_backend bk_ignored  if !{ src -f /etc/haproxy/allowed.lst }"
+            ;;
+        block-only)
+            filter_rules="    # block-only: block known bad networks, allow everyone else
+    use_backend bk_blocked if { src -f /etc/haproxy/blocked.lst }"
+            ;;
+        observe)
+            filter_rules="    # observe: do not block by IP lists; use logs/metrics only"
+            ;;
+    esac
 
     cat > "$haproxy_cfg" <<EOF
 global
@@ -951,9 +993,12 @@ defaults
     timeout client  1h
     timeout server  1h
     timeout tunnel  1h
+    timeout client-fin 30s
+    timeout server-fin 30s
     log             global
     option          tcplog
     option          dontlognull
+    option          tcpka
     retries         3
 
 # ── Main inbound frontend ─────────────────────────────────────────────────────
@@ -962,9 +1007,7 @@ frontend ft_inbound
     tcp-request inspect-delay 5s
     tcp-request content accept if { req_ssl_hello_type 1 }
 
-    # Priority: blocked list first, then allowlist check
-    use_backend bk_blocked if { src -f /etc/haproxy/blocked.lst }
-    use_backend bk_ignored  if !{ src -f /etc/haproxy/allowed.lst }
+${filter_rules}
     default_backend bk_upstream
 
 # ── Silent-drop backends ──────────────────────────────────────────────────────
@@ -984,7 +1027,7 @@ backend bk_upstream
     server upstream ${GATE_ADDRESS}:${GATE_PORT} send-proxy-v2
 EOF
 
-    log_info "HAProxy relay config written (→ ${GATE_ADDRESS}:${GATE_PORT})"
+    log_info "HAProxy relay config written (filter: ${RELAY_FILTER_MODE}, → ${GATE_ADDRESS}:${GATE_PORT})"
 }
 
 # ── Blocklist update script ───────────────────────────────────────────────────
@@ -1255,6 +1298,11 @@ setup_haproxy() {
     # 4. Write HAProxy config
     _write_haproxy_cfg
 
+    if systemctl is-active --quiet caddy 2>/dev/null; then
+        log_warn "Stopping Caddy to free relay port ${RELAY_PORT} for TCP/HAProxy"
+        systemctl stop caddy
+    fi
+
     # 5. Fetch initial lists
     log_info "Fetching initial blocklist..."
     /usr/local/bin/update_blocklist.sh || log_warn "Blocklist fetch failed — continuing with empty list"
@@ -1327,6 +1375,157 @@ OVERRIDE
     echo    "    echo 'show info' | socat stdio /var/run/haproxy/admin.sock"
     echo -e "    ${CYAN}# Force update lists now${RESET}"
     echo    "    /usr/local/bin/update_blocklist.sh && /usr/local/bin/update_allowlist.sh && systemctl reload haproxy"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 11a · XHTTP3 RELAY MODE (Caddy HTTP/3 reverse proxy)
+#
+# Architecture:
+#   Client → RELAY_DOMAIN:443 HTTP/3/QUIC (Caddy on relay)
+#               ├─ static fallback site
+#               └─ reverse_proxy GATE_SCHEME://GATE_ADDRESS:GATE_PORT
+#
+# Gate must expose an HTTP/xHTTP-compatible inbound on GATE_PORT.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_validate_domain() {
+    local d="$1"
+    [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
+}
+
+_ask_xhttp3_params() {
+    _ask_relay_params
+
+    if [[ -z "${RELAY_DOMAIN:-}" ]]; then
+        if [[ "$NON_INTERACTIVE" == true ]]; then
+            log_error "--relay-domain is required for xhttp3 relay transport"
+            exit 1
+        fi
+        while true; do
+            read -rp "  Relay domain for HTTP/3 [example.com]: " RELAY_DOMAIN
+            _validate_domain "$RELAY_DOMAIN" && break
+            log_warn "Invalid domain: '${RELAY_DOMAIN}'"
+        done
+    fi
+    _validate_domain "$RELAY_DOMAIN" || { log_error "Invalid RELAY_DOMAIN: ${RELAY_DOMAIN}"; exit 1; }
+
+    case "$GATE_SCHEME" in
+        http|https) ;;
+        *) log_error "Invalid GATE_SCHEME: ${GATE_SCHEME}. Valid: http | https"; exit 1 ;;
+    esac
+
+    [[ "${GATE_PATH}" == /* ]] || { log_error "GATE_PATH must start with /"; exit 1; }
+    [[ -n "${FALLBACK_SITE_DIR:-}" ]] || FALLBACK_SITE_DIR="/var/www/relay-site"
+
+    log_info "xHTTP3 domain : ${RELAY_DOMAIN}"
+    log_info "xHTTP3 route  : ${GATE_PATH} → ${GATE_SCHEME}://${GATE_ADDRESS}:${GATE_PORT}"
+}
+
+_install_caddy() {
+    if command -v caddy &>/dev/null; then
+        log_ok "Caddy already installed: $(caddy version 2>/dev/null | head -1)"
+        return 0
+    fi
+
+    install_packages debian-keyring debian-archive-keyring apt-transport-https
+    rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
+        > /etc/apt/sources.list.d/caddy-stable.list
+    DEBIAN_FRONTEND=noninteractive $PKG_MGR update -qq
+    install_packages caddy
+    log_ok "Caddy installed: $(caddy version 2>/dev/null | head -1)"
+}
+
+_write_fallback_site() {
+    mkdir -p "$FALLBACK_SITE_DIR"
+    if [[ ! -s "${FALLBACK_SITE_DIR}/index.html" ]]; then
+        cat > "${FALLBACK_SITE_DIR}/index.html" <<'EOF'
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Service</title>
+</head>
+<body>
+  <main>
+    <h1>Service is running</h1>
+  </main>
+</body>
+</html>
+EOF
+    fi
+}
+
+_write_caddy_xhttp3_cfg() {
+    backup_file /etc/caddy/Caddyfile
+    mkdir -p /etc/caddy
+    _write_fallback_site
+
+    local path_matcher="${GATE_PATH}"
+    [[ "$path_matcher" == "/" ]] && path_matcher="/*"
+
+    cat > /etc/caddy/Caddyfile <<EOF
+${RELAY_DOMAIN}:${RELAY_PORT} {
+    encode zstd gzip
+    root * ${FALLBACK_SITE_DIR}
+
+    @xhttp path ${path_matcher}
+    reverse_proxy @xhttp ${GATE_SCHEME}://${GATE_ADDRESS}:${GATE_PORT} {
+        header_up Host {host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-For {remote_host}
+    }
+
+    file_server
+}
+EOF
+
+    log_info "Caddy xHTTP3 config written (${RELAY_DOMAIN}:${RELAY_PORT} → ${GATE_SCHEME}://${GATE_ADDRESS}:${GATE_PORT}${GATE_PATH})"
+}
+
+setup_xhttp3_relay() {
+    log_step "Configuring xHTTP3 relay (Caddy HTTP/3 reverse proxy)"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would configure Caddy HTTP/3: ${RELAY_DOMAIN:-?}:${RELAY_PORT:-443} → ${GATE_SCHEME}://${GATE_ADDRESS:-?}:${GATE_PORT:-9443}${GATE_PATH:-/}"
+        STEP_STATUS["xhttp3"]="DRY"
+        return 0
+    fi
+
+    _ask_xhttp3_params
+    _install_caddy
+    _write_caddy_xhttp3_cfg
+
+    if systemctl is-active --quiet haproxy 2>/dev/null; then
+        log_warn "Stopping HAProxy to free relay port ${RELAY_PORT} for xHTTP3/Caddy"
+        systemctl stop haproxy
+    fi
+
+    if caddy validate --config /etc/caddy/Caddyfile; then
+        systemctl enable caddy &>/dev/null
+        if systemctl is-active --quiet caddy 2>/dev/null; then
+            systemctl reload caddy
+            log_ok "Caddy reloaded gracefully"
+        else
+            systemctl restart caddy
+            log_ok "Caddy started"
+        fi
+        STEP_STATUS["xhttp3"]="OK"
+    else
+        log_error "Caddy config validation failed"
+        STEP_STATUS["xhttp3"]="FAILED"
+        return 1
+    fi
+
+    echo ""
+    log_info "xHTTP3 useful commands:"
+    echo -e "    ${CYAN}# Check HTTP/3 from a client with curl-http3 support${RESET}"
+    echo    "    curl --http3 -I https://${RELAY_DOMAIN}/"
+    echo -e "    ${CYAN}# Caddy logs${RESET}"
+    echo    "    journalctl -u caddy -n 100 --no-pager"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2136,6 +2335,84 @@ check_status_all() {
     print_separator
 }
 
+relay_doctor() {
+    log_step "Relay diagnostics"
+
+    if [[ -z "${GATE_ADDRESS:-}" ]]; then
+        log_error "--gate-address is required for --relay-doctor"
+        return 1
+    fi
+    GATE_PORT="${GATE_PORT:-9443}"
+    _validate_ip "$GATE_ADDRESS" || { log_error "Invalid GATE_ADDRESS: ${GATE_ADDRESS}"; return 1; }
+    _validate_port "$GATE_PORT" || { log_error "Invalid GATE_PORT: ${GATE_PORT}"; return 1; }
+
+    log_info "Target gate: ${GATE_ADDRESS}:${GATE_PORT}"
+    log_info "Transport: ${RELAY_TRANSPORT}"
+
+    echo ""
+    echo -e "  ${BOLD}Kernel network settings${RESET}"
+    for key in \
+        net.ipv4.tcp_congestion_control \
+        net.core.default_qdisc \
+        net.ipv4.tcp_mtu_probing \
+        net.ipv4.tcp_keepalive_time \
+        net.ipv4.tcp_keepalive_intvl \
+        net.ipv4.tcp_keepalive_probes; do
+        printf '    %-38s %s\n' "$key" "$(sysctl -n "$key" 2>/dev/null || echo 'n/a')"
+    done
+
+    echo ""
+    echo -e "  ${BOLD}Gate reachability${RESET}"
+    if command -v ping &>/dev/null; then
+        ping -c 5 -W 2 "$GATE_ADDRESS" 2>/dev/null | sed 's/^/    /' || log_warn "ping failed"
+    fi
+    if command -v nc &>/dev/null; then
+        if nc -vz -w 3 "$GATE_ADDRESS" "$GATE_PORT" 2>&1 | sed 's/^/    /'; then
+            log_ok "TCP connect to gate succeeded"
+        else
+            log_warn "TCP connect to gate failed"
+        fi
+    else
+        log_warn "nc is not installed; skipping TCP connect check"
+    fi
+    if command -v mtr &>/dev/null; then
+        echo ""
+        echo -e "  ${BOLD}MTR relay -> gate${RESET}"
+        mtr -rwzc 50 "$GATE_ADDRESS" 2>/dev/null | sed 's/^/    /' || log_warn "mtr failed"
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}Relay service status${RESET}"
+    case "$RELAY_TRANSPORT" in
+        tcp)
+            systemctl is-active haproxy 2>/dev/null | sed 's/^/    haproxy: /' || true
+            if [[ -S /var/run/haproxy/admin.sock ]] && command -v socat &>/dev/null; then
+                echo "show info" | socat - /var/run/haproxy/admin.sock 2>/dev/null \
+                    | grep -E '^(Name|Version|Uptime_sec|CurrConns|CumConns|Maxconn|Nbproc|Nbthread):' \
+                    | sed 's/^/    /' || true
+            fi
+            for f in /etc/haproxy/blocked.lst /etc/haproxy/allowed.lst; do
+                [[ -f "$f" ]] && printf '    %-28s %s lines\n' "$f" "$(wc -l < "$f")"
+            done
+            ;;
+        xhttp3)
+            systemctl is-active caddy 2>/dev/null | sed 's/^/    caddy: /' || true
+            if [[ -n "${RELAY_DOMAIN:-}" ]] && command -v curl &>/dev/null; then
+                curl -kIs --max-time 10 "https://${RELAY_DOMAIN}:${RELAY_PORT}/" 2>/dev/null \
+                    | head -5 | sed 's/^/    /' || log_warn "HTTPS check failed"
+                if curl --help all 2>/dev/null | grep -q -- '--http3'; then
+                    curl -kIs --http3 --max-time 10 "https://${RELAY_DOMAIN}:${RELAY_PORT}/" 2>/dev/null \
+                        | head -5 | sed 's/^/    /' || log_warn "HTTP/3 check failed"
+                else
+                    log_warn "curl has no HTTP/3 support; skipping --http3 check"
+                fi
+            fi
+            ;;
+    esac
+
+    print_separator
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 17 · SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2181,6 +2458,15 @@ BOOTSTRAP_VERSION="${SCRIPT_VERSION}"
 BOOTSTRAP_MODE="${MODE}"
 BOOTSTRAP_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 GATE_ADDRESS="${GATE_ADDRESS:-}"
+GATE_PORT="${GATE_PORT:-}"
+RELAY_ADDRESS="${RELAY_ADDRESS:-}"
+RELAY_PORT="${RELAY_PORT:-}"
+RELAY_TRANSPORT="${RELAY_TRANSPORT:-}"
+RELAY_FILTER_MODE="${RELAY_FILTER_MODE:-}"
+RELAY_DOMAIN="${RELAY_DOMAIN:-}"
+GATE_SCHEME="${GATE_SCHEME:-}"
+GATE_PATH="${GATE_PATH:-}"
+FALLBACK_SITE_DIR="${FALLBACK_SITE_DIR:-}"
 IS_CONTAINER="${IS_CONTAINER:-false}"
 OS_PRETTY="${OS_PRETTY:-}"
 EOF
@@ -2776,8 +3062,7 @@ run_gate() {
 
 run_relay() {
     log_step "MODE: Relay (NODE RELAY)"
-    # Relay mode: HAProxy handles traffic filtering via blocked.lst + allowed.lst.
-    # mobile443-filter is NOT used here — allowlist logic replaces it.
+    # Relay mode: tcp uses HAProxy; xhttp3 uses Caddy HTTP/3 reverse proxy.
     # remnanode and selfsteal are NOT installed on a relay/router node.
     apt_update
     run_step "base_packages"   setup_base_packages
@@ -2788,7 +3073,11 @@ run_relay() {
     run_step "swap"            setup_swap
     run_step "ufw"             setup_ufw "relay"
     run_step "fail2ban"        setup_fail2ban
-    run_step "haproxy"         setup_haproxy
+    case "$RELAY_TRANSPORT" in
+        tcp)    run_step "haproxy" setup_haproxy ;;
+        xhttp3) run_step "xhttp3"  setup_xhttp3_relay ;;
+        *)      log_error "Unknown relay transport: ${RELAY_TRANSPORT}"; return 1 ;;
+    esac
     STEP_STATUS["mode"]="relay/OK"
 }
 
@@ -2927,7 +3216,14 @@ ${BOLD}Usage:${RESET}
 ${BOLD}Options:${RESET}
   --mode <mode>          Run mode: base | node | gate | relay | custom
   --gate-address <ip>    Gate IP address (required for relay mode)
+  --gate-port <port>     Gate port (default: 9443)
+  --relay-transport <t>  Relay transport: tcp | xhttp3 (default: tcp)
+  --relay-filter <mode>  TCP relay filter: strict | block-only | observe (default: block-only)
+  --relay-domain <name>  xhttp3: domain pointing to this relay
+  --gate-scheme <s>      xhttp3: upstream scheme to gate: http | https (default: http)
+  --gate-path <path>     xhttp3: path to reverse proxy to gate (default: /xhttp/*)
   --allowed-url <url>    URL to fetch allowed.lst (raw GitHub/CDN); empty = use whois/RADB
+  --relay-doctor         Run relay diagnostics and exit
   --resume               Resume interrupted install (skip already-OK steps)
   --uninstall            Interactive uninstall menu
   --dry-run              Simulate — no changes applied
@@ -2948,6 +3244,12 @@ ${BOLD}Examples:${RESET}
 
   # Relay/Node Relay mode with gate address
   bash ${SCRIPT_NAME} --mode relay --gate-address 1.2.3.4 --non-interactive
+
+  # Relay with HTTP/3 reverse proxy transport
+  bash ${SCRIPT_NAME} --mode relay --relay-transport xhttp3 --relay-domain relay.example.com --gate-address 1.2.3.4 --gate-port 9443 --non-interactive
+
+  # Relay diagnostics
+  bash ${SCRIPT_NAME} --relay-doctor --gate-address 1.2.3.4 --gate-port 9443 --relay-transport tcp
 
   # Relay mode with pre-built allowlist from GitHub
   bash ${SCRIPT_NAME} --mode relay --gate-address 1.2.3.4 --allowed-url https://raw.githubusercontent.com/USER/REPO/main/allowed.lst --non-interactive
@@ -2970,6 +3272,13 @@ parse_args() {
             --relay-address)   RELAY_ADDRESS="$2"; shift 2 ;;
             --relay-port)      RELAY_PORT="$2";    shift 2 ;;
             --gate-port)       GATE_PORT="$2";     shift 2 ;;
+            --relay-transport) RELAY_TRANSPORT="$2"; shift 2 ;;
+            --relay-filter)    RELAY_FILTER_MODE="$2"; shift 2 ;;
+            --relay-domain)    RELAY_DOMAIN="$2"; shift 2 ;;
+            --gate-scheme)     GATE_SCHEME="$2"; shift 2 ;;
+            --gate-path)       GATE_PATH="$2"; shift 2 ;;
+            --fallback-site-dir) FALLBACK_SITE_DIR="$2"; shift 2 ;;
+            --relay-doctor)    RELAY_DOCTOR=true; shift ;;
             --resume)          RESUME=true;          shift   ;;
             --uninstall)       UNINSTALL=true;        shift   ;;
             --verbose|-v)      VERBOSE=true;         shift   ;;
@@ -3013,6 +3322,11 @@ main() {
 
     if [[ "$DRY_RUN" == true ]]; then
         log_warn "DRY-RUN mode active — no changes will be made"
+    fi
+
+    if [[ "$RELAY_DOCTOR" == true ]]; then
+        relay_doctor
+        exit $?
     fi
 
     # ── Uninstall mode ────────────────────────────────────────────────────────
