@@ -3630,10 +3630,30 @@ run_xray_wg_relay() {
     run_step "sysctl_xray_wg_relay" apply_sysctl_xray_wg_relay
     run_step "swap"               setup_swap
     run_step "ssh"                setup_ssh
+
+    if [[ "$NON_INTERACTIVE" == false && "${WITH_SUBPAGE:-false}" != true ]]; then
+        echo ""
+        echo -e "  ${BOLD}Optional:${RESET} install subscription page on this server?"
+        echo -e "  ${GRAY}xray-wg-relay can publish subpage on :80/:443 if Xray relay uses another port, e.g. 8443.${RESET}"
+        read -rp "  Install subscription-page? [y/N]: " _sp_ans
+        if [[ "${_sp_ans,,}" == "y" ]]; then
+            WITH_SUBPAGE=true
+            _ask_subpage_params
+        fi
+    elif [[ "${WITH_SUBPAGE:-false}" == true ]]; then
+        if [[ "${XWG_RELAY_PORT:-443}" == "443" ]]; then
+            log_warn "xray-wg-relay uses :443; subscription page also needs :443. Use --xwg-relay-port 8443 or disable --with-subpage."
+        fi
+        _ask_subpage_params
+    fi
+
     run_step "ufw"                setup_ufw "xray-wg-relay"
     run_step "fail2ban"           setup_fail2ban
     run_step "xray_wg_client"     setup_xray_wg_client
     run_step "xray_wg_relay"      setup_xray_wg_relay_nft
+    if [[ "${WITH_SUBPAGE:-false}" == true ]]; then
+        run_step "subpage"        setup_subpage
+    fi
 
     STEP_STATUS["mode"]="xray-wg-relay/OK"
 }
