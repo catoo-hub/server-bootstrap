@@ -1462,15 +1462,23 @@ EOF
 _write_caddy_xhttp3_cfg() {
     backup_file /etc/caddy/Caddyfile
     mkdir -p /etc/caddy
+    mkdir -p /var/log/caddy
     _write_fallback_site
 
     local path_matcher="${GATE_PATH}"
     [[ "$path_matcher" == "/" ]] && path_matcher="/*"
+    if [[ "$path_matcher" != *"*" ]]; then
+        path_matcher="${path_matcher}*"
+    fi
 
     cat > /etc/caddy/Caddyfile <<EOF
 ${RELAY_DOMAIN}:${RELAY_PORT} {
     encode zstd gzip
     root * ${FALLBACK_SITE_DIR}
+    log {
+        output file /var/log/caddy/relay-xhttp-access.log
+        format console
+    }
 
     @xhttp path ${path_matcher}
     reverse_proxy @xhttp ${GATE_SCHEME}://${GATE_ADDRESS}:${GATE_PORT} {
