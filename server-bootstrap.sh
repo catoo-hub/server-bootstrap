@@ -1463,12 +1463,16 @@ _write_caddy_xhttp3_cfg() {
     backup_file /etc/caddy/Caddyfile
     mkdir -p /etc/caddy
     mkdir -p /var/log/caddy
+    chown caddy:caddy /var/log/caddy 2>/dev/null || true
     _write_fallback_site
 
     local path_matcher="${GATE_PATH}"
-    [[ "$path_matcher" == "/" ]] && path_matcher="/*"
-    if [[ "$path_matcher" != *"*" ]]; then
-        path_matcher="${path_matcher}*"
+    local path_base="${GATE_PATH%/}"
+    [[ -z "$path_base" ]] && path_base="/"
+    if [[ "$path_base" == "/" ]]; then
+        path_matcher="/*"
+    else
+        path_matcher="${path_base} ${path_base}/*"
     fi
 
     cat > /etc/caddy/Caddyfile <<EOF
