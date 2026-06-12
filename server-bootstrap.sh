@@ -8,7 +8,7 @@
 #  Usage (non-interactive): bash server-bootstrap.sh --mode node [--options]
 #
 #  Author:  Kitsura VPN
-#  Version: 1.0.5
+#  Version: 1.0.6
 # ==============================================================================
 
 set -euo pipefail
@@ -19,7 +19,7 @@ IFS=$'
 # SECTION 1 · CONSTANTS & GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="1.0.5"
+readonly SCRIPT_VERSION="1.0.6"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/server-bootstrap.log"
 readonly CONFIG_FILE="/etc/server-bootstrap.conf"
@@ -39,6 +39,7 @@ UNINSTALL=false    # Uninstall mode
 RELAY_DOCTOR=false # Run relay diagnostics and exit
 MODE=""         # base | node | gate | relay | custom
 GATE_ADDRESS="" # used in relay mode
+GATE_RELAY_ALLOW_IP="" # gate mode: relay IP allowed before mobile443/UFW filters
 RELAY_ADDRESS=""  # Relay: this server's IP (auto-detected if empty)
 RELAY_PORT="443"  # Relay: port haproxy binds on
 GATE_PORT="9443"  # Relay: port on gate (recommended: NOT 443)
@@ -46,7 +47,7 @@ RELAY_TRANSPORT="tcp" # Relay transport: tcp | xhttp3
 RELAY_FILTER_MODE="block-only" # tcp relay filter: strict | block-only | observe
 RELAY_DOMAIN="" # xhttp3: public domain pointing to this relay
 GATE_SCHEME="http" # xhttp3: upstream scheme to gate: http | https
-GATE_PATH="/xhttp/*" # xhttp3: reverse_proxy path matcher
+GATE_PATH="/xhttp" # xhttp3: reverse_proxy path matcher
 FALLBACK_SITE_DIR="/var/www/relay-site" # xhttp3: static fallback site
 ALLOWED_LST_URL="https://raw.githubusercontent.com/catoo-hub/server-bootstrap/main/allowed.lst"  # Relay: URL to fetch allowed.lst; empty = use whois/RADB
 
@@ -70,6 +71,7 @@ declare -A CHANGELOG=(
     ["1.0.3"]="Version tracking in logs (session header). Changelog display on upgrade. Soft-update mode: backup configs before re-running changed components, merge/restore on failure."
     ["1.0.4"]="HAProxy relay: silent-drop backends (no blackhole server), daemon+nbthread+tunnel timeout, stats HTTP page :8404, systemd Restart=always drop-in, graceful reload. Gate mode: HAProxy-native blocking replaces mobile443-filter (blocked.lst+allowed.lst on gate). Monitoring: Prometheus+Grafana Docker Compose stack with HAProxy+Node Exporter dashboards, provisioned at /opt/monitoring."
     ["1.0.5"]="Relay stability: TCP keepalive sysctl + tcp_mtu_probing, HAProxy tcpka, block-only filter default, xhttp3 relay transport via Caddy HTTP/3 reverse proxy, relay-doctor diagnostics."
+    ["1.0.6"]="xhttp3 hardening: Caddy access-log ownership fix and gate relay pre-allow rules before mobile443/UFW filters."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1463,11 +1465,15 @@ _write_caddy_xhttp3_cfg() {
     backup_file /etc/caddy/Caddyfile
     mkdir -p /etc/caddy
     mkdir -p /var/log/caddy
-    chown caddy:caddy /var/log/caddy 2>/dev/null || true
+    touch /var/log/caddy/relay-xhttp-access.log
+    chown -R caddy:caddy /var/log/caddy 2>/dev/null || true
+    chmod 750 /var/log/caddy 2>/dev/null || true
+    chmod 640 /var/log/caddy/relay-xhttp-access.log 2>/dev/null || true
     _write_fallback_site
 
     local path_matcher="${GATE_PATH}"
-    local path_base="${GATE_PATH%/}"
+    local path_base="${GATE_PATH%\*}"
+    path_base="${path_base%/}"
     [[ -z "$path_base" ]] && path_base="/"
     if [[ "$path_base" == "/" ]]; then
         path_matcher="/*"
@@ -1487,8 +1493,6 @@ ${RELAY_DOMAIN}:${RELAY_PORT} {
     @xhttp path ${path_matcher}
     reverse_proxy @xhttp ${GATE_SCHEME}://${GATE_ADDRESS}:${GATE_PORT} {
         header_up Host {host}
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-For {remote_host}
     }
 
     file_server
@@ -1748,6 +1752,56 @@ install_mobile443_filter() {
         STEP_STATUS["mobile443"]="FAILED"
         return 1
     fi
+}
+
+# ── Gate firewall pre-allow for relay → gate traffic ─────────────────────────
+apply_gate_relay_allow() {
+    local relay_ip="${GATE_RELAY_ALLOW_IP:-}"
+    local port="${GATE_PORT:-9443}"
+
+    log_step "Applying gate relay firewall allow"
+
+    if [[ -z "$relay_ip" ]]; then
+        log_info "No --gate-relay-allow-ip provided — skipping relay pre-allow"
+        STEP_STATUS["gate_relay_allow"]="SKIPPED"
+        return 0
+    fi
+
+    _validate_ip "$relay_ip" || {
+        log_error "Invalid --gate-relay-allow-ip: ${relay_ip}"
+        STEP_STATUS["gate_relay_allow"]="FAILED"
+        return 1
+    }
+    _validate_port "$port" || {
+        log_error "Invalid --gate-port for relay allow: ${port}"
+        STEP_STATUS["gate_relay_allow"]="FAILED"
+        return 1
+    }
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would insert INPUT allow for ${relay_ip} → tcp/udp ${port} before mobile443/UFW filters"
+        STEP_STATUS["gate_relay_allow"]="DRY"
+        return 0
+    fi
+
+    if ! command -v iptables &>/dev/null; then
+        log_warn "iptables not found — cannot install relay pre-allow"
+        STEP_STATUS["gate_relay_allow"]="SKIPPED(no iptables)"
+        return 0
+    fi
+
+    local proto
+    for proto in tcp udp; do
+        if iptables -C INPUT -p "$proto" -s "$relay_ip" --dport "$port" -j ACCEPT 2>/dev/null; then
+            log_debug "iptables allow already exists: ${relay_ip} ${proto}/${port}"
+        else
+            iptables -I INPUT 1 -p "$proto" -s "$relay_ip" --dport "$port" -j ACCEPT
+            log_info "Inserted iptables allow: ${relay_ip} → ${proto}/${port}"
+        fi
+    done
+
+    log_ok "Gate relay pre-allow active for ${relay_ip} on tcp/udp ${port}"
+    STEP_STATUS["gate_relay_allow"]="OK"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2470,6 +2524,7 @@ BOOTSTRAP_VERSION="${SCRIPT_VERSION}"
 BOOTSTRAP_MODE="${MODE}"
 BOOTSTRAP_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 GATE_ADDRESS="${GATE_ADDRESS:-}"
+GATE_RELAY_ALLOW_IP="${GATE_RELAY_ALLOW_IP:-}"
 GATE_PORT="${GATE_PORT:-}"
 RELAY_ADDRESS="${RELAY_ADDRESS:-}"
 RELAY_PORT="${RELAY_PORT:-}"
@@ -3067,6 +3122,7 @@ run_gate() {
     run_step "ufw"             setup_ufw "gate"
     run_step "fail2ban"        setup_fail2ban
     run_step "mobile443"       install_mobile443_filter "gate"
+    run_step "gate_relay_allow" apply_gate_relay_allow
     run_step "remnanode"       install_remnanode
     run_step "selfsteal"       install_selfsteal
     STEP_STATUS["mode"]="gate/OK"
@@ -3229,11 +3285,13 @@ ${BOLD}Options:${RESET}
   --mode <mode>          Run mode: base | node | gate | relay | custom
   --gate-address <ip>    Gate IP address (required for relay mode)
   --gate-port <port>     Gate port (default: 9443)
+  --gate-relay-allow-ip <ip>
+                         [gate] Relay IP to allow before mobile443/UFW filters
   --relay-transport <t>  Relay transport: tcp | xhttp3 (default: tcp)
   --relay-filter <mode>  TCP relay filter: strict | block-only | observe (default: block-only)
   --relay-domain <name>  xhttp3: domain pointing to this relay
   --gate-scheme <s>      xhttp3: upstream scheme to gate: http | https (default: http)
-  --gate-path <path>     xhttp3: path to reverse proxy to gate (default: /xhttp/*)
+  --gate-path <path>     xhttp3: path to reverse proxy to gate (default: /xhttp)
   --allowed-url <url>    URL to fetch allowed.lst (raw GitHub/CDN); empty = use whois/RADB
   --relay-doctor         Run relay diagnostics and exit
   --resume               Resume interrupted install (skip already-OK steps)
@@ -3256,6 +3314,9 @@ ${BOLD}Examples:${RESET}
 
   # Relay/Node Relay mode with gate address
   bash ${SCRIPT_NAME} --mode relay --gate-address 1.2.3.4 --non-interactive
+
+  # Gate mode allowing one relay to reach Xray before mobile443 filters
+  bash ${SCRIPT_NAME} --mode gate --gate-port 8443 --gate-relay-allow-ip 5.6.7.8 --non-interactive
 
   # Relay with HTTP/3 reverse proxy transport
   bash ${SCRIPT_NAME} --mode relay --relay-transport xhttp3 --relay-domain relay.example.com --gate-address 1.2.3.4 --gate-port 9443 --non-interactive
@@ -3280,6 +3341,7 @@ parse_args() {
         case "$1" in
             --mode)            MODE="$2";          shift 2 ;;
             --gate-address)    GATE_ADDRESS="$2";    shift 2 ;;
+            --gate-relay-allow-ip) GATE_RELAY_ALLOW_IP="$2"; shift 2 ;;
             --allowed-url)     ALLOWED_LST_URL="$2"; shift 2 ;;
             --relay-address)   RELAY_ADDRESS="$2"; shift 2 ;;
             --relay-port)      RELAY_PORT="$2";    shift 2 ;;
