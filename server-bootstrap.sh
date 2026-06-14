@@ -8,7 +8,7 @@
 #  Usage (non-interactive): bash server-bootstrap.sh --mode node [--options]
 #
 #  Author:  Kitsura VPN
-#  Version: 1.0.6
+#  Version: 1.0.7
 # ==============================================================================
 
 set -euo pipefail
@@ -19,7 +19,7 @@ IFS=$'
 # SECTION 1 · CONSTANTS & GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="1.0.6"
+readonly SCRIPT_VERSION="1.0.7"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/server-bootstrap.log"
 readonly CONFIG_FILE="/etc/server-bootstrap.conf"
@@ -72,6 +72,7 @@ declare -A CHANGELOG=(
     ["1.0.4"]="HAProxy relay: silent-drop backends (no blackhole server), daemon+nbthread+tunnel timeout, stats HTTP page :8404, systemd Restart=always drop-in, graceful reload. Gate mode: HAProxy-native blocking replaces mobile443-filter (blocked.lst+allowed.lst on gate). Monitoring: Prometheus+Grafana Docker Compose stack with HAProxy+Node Exporter dashboards, provisioned at /opt/monitoring."
     ["1.0.5"]="Relay stability: TCP keepalive sysctl + tcp_mtu_probing, HAProxy tcpka, block-only filter default, xhttp3 relay transport via Caddy HTTP/3 reverse proxy, relay-doctor diagnostics."
     ["1.0.6"]="xhttp3 hardening: Caddy access-log ownership fix and gate relay pre-allow rules before mobile443/UFW filters."
+    ["1.0.7"]="Gate relay pre-allow persistence: writes helper script and cron @reboot so mobile443/UFW ordering remains correct after reboot."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1790,17 +1791,32 @@ apply_gate_relay_allow() {
         return 0
     fi
 
-    local proto
-    for proto in tcp udp; do
-        if iptables -C INPUT -p "$proto" -s "$relay_ip" --dport "$port" -j ACCEPT 2>/dev/null; then
-            log_debug "iptables allow already exists: ${relay_ip} ${proto}/${port}"
-        else
-            iptables -I INPUT 1 -p "$proto" -s "$relay_ip" --dport "$port" -j ACCEPT
-            log_info "Inserted iptables allow: ${relay_ip} → ${proto}/${port}"
-        fi
-    done
+    local helper="/usr/local/bin/server-bootstrap-allow-relay-gate.sh"
+    cat > "$helper" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
 
-    log_ok "Gate relay pre-allow active for ${relay_ip} on tcp/udp ${port}"
+RELAY_IP="${relay_ip}"
+GATE_PORT="${port}"
+
+for proto in tcp udp; do
+    if iptables -C INPUT -p "\$proto" -s "\$RELAY_IP" --dport "\$GATE_PORT" -j ACCEPT 2>/dev/null; then
+        continue
+    fi
+    iptables -I INPUT 1 -p "\$proto" -s "\$RELAY_IP" --dport "\$GATE_PORT" -j ACCEPT
+done
+EOF
+    chmod +x "$helper"
+
+    cat > /etc/cron.d/server-bootstrap-allow-relay-gate <<EOF
+# server-bootstrap: keep relay -> gate allow rules above mobile443/UFW filters
+@reboot root ${helper}
+*/5 * * * * root ${helper}
+EOF
+
+    "$helper"
+
+    log_ok "Gate relay pre-allow active and persistent for ${relay_ip} on tcp/udp ${port}"
     STEP_STATUS["gate_relay_allow"]="OK"
 }
 
